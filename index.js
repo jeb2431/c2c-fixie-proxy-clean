@@ -1,5 +1,5 @@
 import express from "express";
-import { HttpsProxyAgent } from "https-proxy-agent";
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 
 const app = express();
 
@@ -16,13 +16,13 @@ app.get("/ip", async (req, res) => {
       return res.status(500).json({ error: "FIXIE_URL is not set" });
     }
 
-    // Use Fixie as an HTTP/HTTPS proxy (matches Fixie dashboard outbound IPs)
-    const agent = new HttpsProxyAgent(fixieUrl);
+    // Undici (Node 22 fetch) uses "dispatcher", not "agent"
+    const dispatcher = new ProxyAgent(fixieUrl);
 
-    const r = await fetch("https://api.ipify.org?format=json", { agent });
+    const r = await undiciFetch("https://api.ipify.org?format=json", { dispatcher });
     const data = await r.json();
 
-    res.json({ via: "fixie-http", ip: data.ip });
+    res.json({ via: "fixie-http-undici", ip: data.ip });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
