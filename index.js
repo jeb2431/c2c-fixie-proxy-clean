@@ -1,5 +1,5 @@
 import express from "express";
-import { SocksProxyAgent } from "socks-proxy-agent";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
 
@@ -8,7 +8,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Prove outbound traffic is going through Fixie by fetching our public IP
+// Prove outbound traffic is going through Fixie HTTP proxy by fetching our public IP
 app.get("/ip", async (req, res) => {
   try {
     const fixieUrl = process.env.FIXIE_URL;
@@ -16,17 +16,13 @@ app.get("/ip", async (req, res) => {
       return res.status(500).json({ error: "FIXIE_URL is not set" });
     }
 
-    // Fixie provides an HTTP proxy. Convert it to a socks proxy via their gateway.
-    // Most Fixie accounts support SOCKS at: socks://<user>:<pass>@<host>:1080
-    const u = new URL(fixieUrl);
-    const socksUrl = `socks://${u.username}:${u.password}@${u.hostname}:1080`;
-
-    const agent = new SocksProxyAgent(socksUrl);
+    // Use Fixie as an HTTP/HTTPS proxy (matches Fixie dashboard outbound IPs)
+    const agent = new HttpsProxyAgent(fixieUrl);
 
     const r = await fetch("https://api.ipify.org?format=json", { agent });
     const data = await r.json();
 
-    res.json({ via: "fixie", ip: data.ip });
+    res.json({ via: "fixie-http", ip: data.ip });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
