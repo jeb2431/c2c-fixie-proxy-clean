@@ -10,3 +10,7 @@
     "express": "^4.19.2"
   }
 }
+"dependencies": {
+  "express": "^4.19.2",
+  "socks-proxy-agent": "^8.0.3"
+}
