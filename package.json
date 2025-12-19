@@ -7,7 +7,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "https-proxy-agent": "^7.0.6"
+    "express": "^4.19.2"
   }
 }
