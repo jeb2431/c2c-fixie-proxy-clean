@@ -4,7 +4,7 @@ import { ProxyAgent, fetch as undiciFetch } from "undici";
 const app = express();
 
 // Capture raw request bodies so we can forward exactly what Base44 sends
-app.use(express.raw({ type: "*/*", limit: "2mb" }));
+app.use(express.raw({ type: "*/*", limit: "5mb" }));
 
 // Health check (Render)
 app.get("/health", (req, res) => {
@@ -28,19 +28,11 @@ app.get("/ip", async (req, res) => {
 });
 
 /**
- * Generic ConsumerDirect forwarder
- * Call:
- *   /cd/<anything>
- * It forwards to:
- *   ${CONSUMERDIRECT_BASE_URL}/<anything>
- *
- * It forwards these headers if present:
- * - authorization
- * - x-api-key
- * - x-internal-secret
- * - content-type
- *
- * And it returns the upstream status + body so debugging is easy.
+ * ConsumerDirect forwarder
+ * Request:
+ *   /cd/<path>
+ * Forwards to:
+ *   ${CONSUMERDIRECT_BASE_URL}/<path>
  */
 app.all("/cd/*", async (req, res) => {
   try {
@@ -52,10 +44,42 @@ app.all("/cd/*", async (req, res) => {
 
     const dispatcher = new ProxyAgent(fixieUrl);
 
+    // Build target URL
     const targetPath = req.originalUrl.replace(/^\/cd/, "");
     const url = new URL(targetPath, baseUrl);
 
-    // Only forward a small, safe set of headers (keeps things deterministic)
+    // Forward a controlled set of headers (keep deterministic)
     const headers = {};
-    const passthrough = ["authorization", "x-api-key", "x-internal-secret", "content-type"];
-    for (const h
+    const passthrough = ["authorization", "x-api-key", "x-internal-secret", "content-type", "accept"];
+
+    for (const h of passthrough) {
+      const v = req.headers[h];
+      if (v) headers[h] = v;
+    }
+
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
+    if (hasBody && !headers["content-type"]) headers["content-type"] = "application/json";
+
+    const upstream = await undiciFetch(url.toString(), {
+      method: req.method,
+      headers,
+      body: hasBody ? req.body : undefined,
+      dispatcher
+    });
+
+    const text = await upstream.text();
+
+    // Return upstream status + body exactly
+    res.status(upstream.status);
+    res.set("x-cd-proxy-status", String(upstream.status));
+    res.set("content-type", upstream.headers.get("content-type") || "text/plain");
+    res.send(text);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Proxy running on port ${port}`);
+});
