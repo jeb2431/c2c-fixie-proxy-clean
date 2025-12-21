@@ -1,37 +1,80 @@
-// index.js (FULL REPLACEMENT - paste this whole file)
-
 import express from "express";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
-
-// Keep raw body so we can forward anything (JSON, form, etc.)
 app.use(express.raw({ type: "*/*", limit: "5mb" }));
 
-// BASIC
+/**
+ * REQUIRED ENV VARS on Render:
+ * FIXIE_URL
+ * CONSUMERDIRECT_BASE_URL
+ * CONSUMERDIRECT_CLIENT_ID
+ * CONSUMERDIRECT_CLIENT_SECRET
+ * PROXY_API_KEY
+ * ALLOWED_ORIGINS   (comma-separated, e.g. https://credit2credit.com,https://app.credit2credit.com)
+ */
+
+// ---------- Basic security helpers ----------
+function requireApiKey(req, res, next) {
+  const key = req.headers["x-api-key"];
+  if (!process.env.PROXY_API_KEY) {
+    return res.status(500).json({ error: "Server misconfigured: PROXY_API_KEY not set" });
+  }
+  if (!key || key !== process.env.PROXY_API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+function corsLockdown(req, res, next) {
+  const allow = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const origin = req.headers.origin;
+
+  // If no origins are configured, do not allow browsers by default
+  if (allow.length === 0) {
+    return next();
+  }
+
+  if (origin && allow.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, x-api-key");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  }
+
+  if (req.method === "OPTIONS") return res.status(204).send("");
+  next();
+}
+
+app.use(corsLockdown);
+
+// Health should be public for Render checks
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-app.get("/ip", async (req, res) => {
-  try {
-    const fixieUrl = process.env.FIXIE_URL;
-    if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
+// Everything else requires the API key
+app.use(requireApiKey);
 
-    const httpsAgent = new HttpsProxyAgent(fixieUrl);
+// ---------- Fixie proxy agent ----------
+function getHttpsAgent() {
+  const fixieUrl = process.env.FIXIE_URL;
+  if (!fixieUrl) throw new Error("FIXIE_URL is not set");
+  return new HttpsProxyAgent(fixieUrl);
+}
 
-    const r = await axios.get("https://api.ipify.org?format=json", {
-      httpsAgent,
-      timeout: 30000,
-    });
+// ---------- ConsumerDirect OAuth (cached token) ----------
+let cachedToken = null;
+let cachedTokenExpMs = 0;
 
-    res.json({ via: "fixie-https-proxy-agent", ip: r.data.ip });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-// CONSUMERDIRECT TOKEN
 async function getConsumerDirectToken(httpsAgent) {
+  // Reuse token until ~60 seconds before expiry
+  const now = Date.now();
+  if (cachedToken && now < cachedTokenExpMs - 60_000) return cachedToken;
+
   const clientId = process.env.CONSUMERDIRECT_CLIENT_ID;
   const clientSecret = process.env.CONSUMERDIRECT_CLIENT_SECRET;
 
@@ -57,141 +100,63 @@ async function getConsumerDirectToken(httpsAgent) {
   });
 
   if (r.status < 200 || r.status >= 300) {
-    const err = new Error("Token request failed");
-    err.status = r.status;
-    err.payload = r.data;
-    throw err;
+    return {
+      ok: false,
+      status: r.status,
+      data: r.data,
+    };
   }
 
-  if (!r.data || !r.data.access_token) {
-    const err = new Error("No access_token returned");
-    err.status = 500;
-    err.payload = r.data;
-    throw err;
+  const accessToken = r.data?.access_token;
+  const expiresIn = Number(r.data?.expires_in || 900); // seconds
+  if (!accessToken) {
+    return { ok: false, status: 500, data: r.data };
   }
 
-  return r.data.access_token;
+  cachedToken = accessToken;
+  cachedTokenExpMs = Date.now() + expiresIn * 1000;
+
+  return { ok: true, token: accessToken, expiresIn };
 }
 
-app.get("/cd-token", async (req, res) => {
+// Debug route (safe-ish): shows only token preview
+app.get("/cd-token-preview", async (req, res) => {
   try {
-    const fixieUrl = process.env.FIXIE_URL;
-    if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
+    const httpsAgent = getHttpsAgent();
+    const t = await getConsumerDirectToken(httpsAgent);
+    if (!t.ok) return res.status(t.status || 500).json({ error: "Token failed", details: t.data });
 
-    const httpsAgent = new HttpsProxyAgent(fixieUrl);
-    const token = await getConsumerDirectToken(httpsAgent);
-
-    res.json({ ok: true, access_token_preview: token.slice(0, 25) + "..." });
+    res.json({ ok: true, expiresIn: t.expiresIn, access_token_preview: t.token.slice(0, 25) + "..." });
   } catch (e) {
-    res.status(e.status || 500).json({ error: String(e?.message || e), details: e.payload });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// TEST: GET /v1/customers
-app.get("/cd-test-customers", async (req, res) => {
-  try {
-    const fixieUrl = process.env.FIXIE_URL;
-    const baseUrl = process.env.CONSUMERDIRECT_BASE_URL;
-
-    if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
-    if (!baseUrl) return res.status(500).json({ error: "CONSUMERDIRECT_BASE_URL is not set" });
-
-    const httpsAgent = new HttpsProxyAgent(fixieUrl);
-    const token = await getConsumerDirectToken(httpsAgent);
-
-    const url = new URL("/v1/customers", baseUrl);
-
-    const upstream = await axios.get(url.toString(), {
-      httpsAgent,
-      timeout: 30000,
-      headers: {
-        authorization: `Bearer ${token}`,
-        accept: "application/json",
-      },
-      validateStatus: () => true,
-      responseType: "text",
-      transformResponse: (x) => x, // keep raw
-    });
-
-    res
-      .status(upstream.status)
-      .set("content-type", upstream.headers["content-type"] || "text/plain")
-      .send(upstream.data);
-  } catch (e) {
-    res.status(e.status || 500).json({ error: String(e?.message || e), details: e.payload });
-  }
-});
-
-// TEST: LOGIN-AS (debug 403/WAF)
-app.get("/cd-test-login-as", async (req, res) => {
-  try {
-    const customerToken = req.query.customerToken;
-    if (!customerToken) {
-      return res.status(400).json({ error: "Missing customerToken. Use: /cd-test-login-as?customerToken=..." });
-    }
-
-    const fixieUrl = process.env.FIXIE_URL;
-    const baseUrl = process.env.CONSUMERDIRECT_BASE_URL;
-
-    if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
-    if (!baseUrl) return res.status(500).json({ error: "CONSUMERDIRECT_BASE_URL is not set" });
-
-    const httpsAgent = new HttpsProxyAgent(fixieUrl);
-    const token = await getConsumerDirectToken(httpsAgent);
-
-    const url = new URL(`/v1/customers/${customerToken}/otcs/login-as`, baseUrl);
-
-    const upstream = await axios.post(
-      url.toString(),
-      { agentId: "Credit2Credit Support" },
-      {
-        httpsAgent,
-        timeout: 30000,
-        headers: {
-          authorization: `Bearer ${token}`,
-          accept: "application/json",
-          "content-type": "application/json",
-        },
-        validateStatus: () => true,
-        responseType: "text",
-        transformResponse: (x) => x,
-      }
-    );
-
-    res
-      .status(upstream.status)
-      .set("content-type", upstream.headers["content-type"] || "text/plain")
-      .send(upstream.data);
-  } catch (e) {
-    res.status(e.status || 500).json({ error: String(e?.message || e), details: e.payload });
-  }
-});
-
-// OPTIONAL FORWARDER (kept)
+// ---------- Main gateway: /cd/* forwards to ConsumerDirect ----------
 app.all("/cd/*", async (req, res) => {
   try {
-    const fixieUrl = process.env.FIXIE_URL;
     const baseUrl = process.env.CONSUMERDIRECT_BASE_URL;
-
-    if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
     if (!baseUrl) return res.status(500).json({ error: "CONSUMERDIRECT_BASE_URL is not set" });
 
-    const httpsAgent = new HttpsProxyAgent(fixieUrl);
-
-    const targetPath = req.originalUrl.replace(/^\/cd/, "");
-    const url = new URL(targetPath, baseUrl);
-
-    // Pass through only a few headers
-    const headers = {};
-    const passthrough = ["authorization", "content-type", "accept"];
-    for (const h of passthrough) {
-      const v = req.headers[h];
-      if (v) headers[h] = v;
+    const httpsAgent = getHttpsAgent();
+    const tokenResp = await getConsumerDirectToken(httpsAgent);
+    if (!tokenResp.ok) {
+      return res.status(tokenResp.status || 500).json({ error: "Token failed", details: tokenResp.data });
     }
 
-    const hasBody = req.method !== "GET" && req.method !== "HEAD";
-    if (hasBody && !headers["content-type"]) headers["content-type"] = "application/json";
+    const targetPath = req.originalUrl.replace(/^\/cd/, ""); // keep query string
+    const url = new URL(targetPath, baseUrl);
 
+    // Pass through content-type/accept if present
+    const headers = {
+      authorization: `Bearer ${tokenResp.token}`,
+      accept: req.headers["accept"] || "application/json",
+    };
+
+    const ct = req.headers["content-type"];
+    if (ct) headers["content-type"] = ct;
+
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
     const upstream = await axios.request({
       url: url.toString(),
       method: req.method,
@@ -203,13 +168,14 @@ app.all("/cd/*", async (req, res) => {
       responseType: "arraybuffer",
     });
 
-    // Send upstream response back
-    const contentType = upstream.headers["content-type"] || "text/plain";
-    res.status(upstream.status).set("content-type", contentType).send(Buffer.from(upstream.data));
+    res
+      .status(upstream.status)
+      .set("content-type", upstream.headers["content-type"] || "application/octet-stream")
+      .send(Buffer.from(upstream.data));
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Proxy running on port ${port}`));
+app.listen(port, () => console.log(`C2C gateway running on port ${port}`));
