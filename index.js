@@ -11,22 +11,11 @@ app.use(express.raw({ type: "*/*", limit: "5mb" }));
  * CONSUMERDIRECT_BASE_URL
  * CONSUMERDIRECT_CLIENT_ID
  * CONSUMERDIRECT_CLIENT_SECRET
- * PROXY_API_KEY
- * ALLOWED_ORIGINS   (comma-separated, e.g. https://credit2credit.com,https://app.credit2credit.com)
+ * CD_PROXY_INTERNAL_SHARED_SECRET
+ * ALLOWED_ORIGINS (optional but recommended)
  */
 
-// ---------- Basic security helpers ----------
-function requireApiKey(req, res, next) {
-  const key = req.headers["x-api-key"];
-  if (!process.env.PROXY_API_KEY) {
-    return res.status(500).json({ error: "Server misconfigured: PROXY_API_KEY not set" });
-  }
-  if (!key || key !== process.env.PROXY_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  next();
-}
-
+// ------------------ Simple browser safety (CORS) ------------------
 function corsLockdown(req, res, next) {
   const allow = (process.env.ALLOWED_ORIGINS || "")
     .split(",")
@@ -35,15 +24,13 @@ function corsLockdown(req, res, next) {
 
   const origin = req.headers.origin;
 
-  // If no origins are configured, do not allow browsers by default
-  if (allow.length === 0) {
-    return next();
-  }
+  // If no origins are configured, do nothing (server-to-server calls still work)
+  if (allow.length === 0) return next();
 
   if (origin && allow.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, x-api-key");
+    res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, x-cd-proxy-secret");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   }
 
@@ -53,27 +40,43 @@ function corsLockdown(req, res, next) {
 
 app.use(corsLockdown);
 
-// Health should be public for Render checks
+// ------------------ Public health check ------------------
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// Everything else requires the API key
-app.use(requireApiKey);
+// ------------------ ONE SECRET ONLY (Base44 -> Render) ------------------
+function requireInternalSecret(req, res, next) {
+  const expected = process.env.CD_PROXY_INTERNAL_SHARED_SECRET;
+  if (!expected) {
+    return res.status(500).json({ error: "Server misconfigured: CD_PROXY_INTERNAL_SHARED_SECRET not set" });
+  }
 
-// ---------- Fixie proxy agent ----------
+  // Base44 should send this header
+  const provided = req.headers["x-cd-proxy-secret"];
+
+  if (!provided || provided !== expected) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  next();
+}
+
+// Everything below requires the shared secret
+app.use(requireInternalSecret);
+
+// ------------------ Fixie agent ------------------
 function getHttpsAgent() {
   const fixieUrl = process.env.FIXIE_URL;
   if (!fixieUrl) throw new Error("FIXIE_URL is not set");
   return new HttpsProxyAgent(fixieUrl);
 }
 
-// ---------- ConsumerDirect OAuth (cached token) ----------
+// ------------------ ConsumerDirect token (cached) ------------------
 let cachedToken = null;
 let cachedTokenExpMs = 0;
 
 async function getConsumerDirectToken(httpsAgent) {
-  // Reuse token until ~60 seconds before expiry
   const now = Date.now();
-  if (cachedToken && now < cachedTokenExpMs - 60_000) return cachedToken;
+  if (cachedToken && now < cachedTokenExpMs - 60_000) return { ok: true, token: cachedToken };
 
   const clientId = process.env.CONSUMERDIRECT_CLIENT_ID;
   const clientSecret = process.env.CONSUMERDIRECT_CLIENT_SECRET;
@@ -94,24 +97,19 @@ async function getConsumerDirectToken(httpsAgent) {
     timeout: 30000,
     headers: {
       "content-type": "application/x-www-form-urlencoded",
-      authorization: `Basic ${basic}`,
+      authorization: `Basic ${basic}`
     },
-    validateStatus: () => true,
+    validateStatus: () => true
   });
 
   if (r.status < 200 || r.status >= 300) {
-    return {
-      ok: false,
-      status: r.status,
-      data: r.data,
-    };
+    return { ok: false, status: r.status, data: r.data };
   }
 
   const accessToken = r.data?.access_token;
-  const expiresIn = Number(r.data?.expires_in || 900); // seconds
-  if (!accessToken) {
-    return { ok: false, status: 500, data: r.data };
-  }
+  const expiresIn = Number(r.data?.expires_in || 900);
+
+  if (!accessToken) return { ok: false, status: 500, data: r.data };
 
   cachedToken = accessToken;
   cachedTokenExpMs = Date.now() + expiresIn * 1000;
@@ -119,20 +117,20 @@ async function getConsumerDirectToken(httpsAgent) {
   return { ok: true, token: accessToken, expiresIn };
 }
 
-// Debug route (safe-ish): shows only token preview
+// Safe debug route: does NOT expose full token
 app.get("/cd-token-preview", async (req, res) => {
   try {
     const httpsAgent = getHttpsAgent();
     const t = await getConsumerDirectToken(httpsAgent);
     if (!t.ok) return res.status(t.status || 500).json({ error: "Token failed", details: t.data });
 
-    res.json({ ok: true, expiresIn: t.expiresIn, access_token_preview: t.token.slice(0, 25) + "..." });
+    res.json({ ok: true, access_token_preview: t.token.slice(0, 25) + "..." });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ---------- Main gateway: /cd/* forwards to ConsumerDirect ----------
+// ------------------ Main gateway: /cd/* forwards to ConsumerDirect ------------------
 app.all("/cd/*", async (req, res) => {
   try {
     const baseUrl = process.env.CONSUMERDIRECT_BASE_URL;
@@ -140,32 +138,30 @@ app.all("/cd/*", async (req, res) => {
 
     const httpsAgent = getHttpsAgent();
     const tokenResp = await getConsumerDirectToken(httpsAgent);
-    if (!tokenResp.ok) {
-      return res.status(tokenResp.status || 500).json({ error: "Token failed", details: tokenResp.data });
-    }
+    if (!tokenResp.ok) return res.status(tokenResp.status || 500).json({ error: "Token failed", details: tokenResp.data });
 
-    const targetPath = req.originalUrl.replace(/^\/cd/, ""); // keep query string
+    const targetPath = req.originalUrl.replace(/^\/cd/, ""); // keeps query string
     const url = new URL(targetPath, baseUrl);
 
-    // Pass through content-type/accept if present
     const headers = {
       authorization: `Bearer ${tokenResp.token}`,
-      accept: req.headers["accept"] || "application/json",
+      accept: req.headers["accept"] || "application/json"
     };
 
     const ct = req.headers["content-type"];
     if (ct) headers["content-type"] = ct;
 
     const hasBody = req.method !== "GET" && req.method !== "HEAD";
+
     const upstream = await axios.request({
       url: url.toString(),
       method: req.method,
       httpsAgent,
       timeout: 30000,
       headers,
-      data: hasBody ? req.body : undefined, // Buffer from express.raw
+      data: hasBody ? req.body : undefined,
       validateStatus: () => true,
-      responseType: "arraybuffer",
+      responseType: "arraybuffer"
     });
 
     res
