@@ -1,7 +1,12 @@
+// index.js (FULL REPLACEMENT - paste this whole file)
+
 import express from "express";
-import { ProxyAgent, fetch as undiciFetch } from "undici";
+import axios from "axios";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
+
+// Keep raw body so we can forward anything (JSON, form, etc.)
 app.use(express.raw({ type: "*/*", limit: "5mb" }));
 
 // BASIC
@@ -12,17 +17,21 @@ app.get("/ip", async (req, res) => {
     const fixieUrl = process.env.FIXIE_URL;
     if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
 
-    const dispatcher = new ProxyAgent(fixieUrl);
-    const r = await undiciFetch("https://api.ipify.org?format=json", { dispatcher });
-    const data = await r.json();
-    res.json({ via: "fixie-http-undici", ip: data.ip });
+    const httpsAgent = new HttpsProxyAgent(fixieUrl);
+
+    const r = await axios.get("https://api.ipify.org?format=json", {
+      httpsAgent,
+      timeout: 30000,
+    });
+
+    res.json({ via: "fixie-https-proxy-agent", ip: r.data.ip });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
 // CONSUMERDIRECT TOKEN
-async function getConsumerDirectToken(dispatcher) {
+async function getConsumerDirectToken(httpsAgent) {
   const clientId = process.env.CONSUMERDIRECT_CLIENT_ID;
   const clientSecret = process.env.CONSUMERDIRECT_CLIENT_SECRET;
 
@@ -37,32 +46,31 @@ async function getConsumerDirectToken(dispatcher) {
   body.set("grant_type", "client_credentials");
   body.set("scope", scope);
 
-  const r = await undiciFetch(tokenUrl, {
-    method: "POST",
-    dispatcher,
+  const r = await axios.post(tokenUrl, body.toString(), {
+    httpsAgent,
+    timeout: 30000,
     headers: {
       "content-type": "application/x-www-form-urlencoded",
-      "authorization": `Basic ${basic}`
+      authorization: `Basic ${basic}`,
     },
-    body: body.toString()
+    validateStatus: () => true,
   });
 
-  const json = await r.json().catch(async () => ({ raw: await r.text() }));
-  if (!r.ok) {
+  if (r.status < 200 || r.status >= 300) {
     const err = new Error("Token request failed");
     err.status = r.status;
-    err.payload = json;
+    err.payload = r.data;
     throw err;
   }
 
-  if (!json.access_token) {
+  if (!r.data || !r.data.access_token) {
     const err = new Error("No access_token returned");
     err.status = 500;
-    err.payload = json;
+    err.payload = r.data;
     throw err;
   }
 
-  return json.access_token;
+  return r.data.access_token;
 }
 
 app.get("/cd-token", async (req, res) => {
@@ -70,12 +78,12 @@ app.get("/cd-token", async (req, res) => {
     const fixieUrl = process.env.FIXIE_URL;
     if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
 
-    const dispatcher = new ProxyAgent(fixieUrl);
-    const token = await getConsumerDirectToken(dispatcher);
+    const httpsAgent = new HttpsProxyAgent(fixieUrl);
+    const token = await getConsumerDirectToken(httpsAgent);
 
     res.json({ ok: true, access_token_preview: token.slice(0, 25) + "..." });
   } catch (e) {
-    res.status(e.status || 500).json({ error: String(e.message || e), details: e.payload });
+    res.status(e.status || 500).json({ error: String(e?.message || e), details: e.payload });
   }
 });
 
@@ -88,30 +96,33 @@ app.get("/cd-test-customers", async (req, res) => {
     if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
     if (!baseUrl) return res.status(500).json({ error: "CONSUMERDIRECT_BASE_URL is not set" });
 
-    const dispatcher = new ProxyAgent(fixieUrl);
-    const token = await getConsumerDirectToken(dispatcher);
+    const httpsAgent = new HttpsProxyAgent(fixieUrl);
+    const token = await getConsumerDirectToken(httpsAgent);
 
     const url = new URL("/v1/customers", baseUrl);
 
-    const upstream = await undiciFetch(url.toString(), {
-      method: "GET",
-      dispatcher,
+    const upstream = await axios.get(url.toString(), {
+      httpsAgent,
+      timeout: 30000,
       headers: {
-        "authorization": `Bearer ${token}`,
-        "accept": "application/json"
-      }
+        authorization: `Bearer ${token}`,
+        accept: "application/json",
+      },
+      validateStatus: () => true,
+      responseType: "text",
+      transformResponse: (x) => x, // keep raw
     });
 
-    const text = await upstream.text();
-    res.status(upstream.status)
-      .set("content-type", upstream.headers.get("content-type") || "text/plain")
-      .send(text);
+    res
+      .status(upstream.status)
+      .set("content-type", upstream.headers["content-type"] || "text/plain")
+      .send(upstream.data);
   } catch (e) {
-    res.status(e.status || 500).json({ error: String(e.message || e), details: e.payload });
+    res.status(e.status || 500).json({ error: String(e?.message || e), details: e.payload });
   }
 });
 
-// TEST: LOGIN-AS (this is what you need to debug 403/WAF)
+// TEST: LOGIN-AS (debug 403/WAF)
 app.get("/cd-test-login-as", async (req, res) => {
   try {
     const customerToken = req.query.customerToken;
@@ -125,28 +136,34 @@ app.get("/cd-test-login-as", async (req, res) => {
     if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
     if (!baseUrl) return res.status(500).json({ error: "CONSUMERDIRECT_BASE_URL is not set" });
 
-    const dispatcher = new ProxyAgent(fixieUrl);
-    const token = await getConsumerDirectToken(dispatcher);
+    const httpsAgent = new HttpsProxyAgent(fixieUrl);
+    const token = await getConsumerDirectToken(httpsAgent);
 
     const url = new URL(`/v1/customers/${customerToken}/otcs/login-as`, baseUrl);
 
-    const upstream = await undiciFetch(url.toString(), {
-      method: "POST",
-      dispatcher,
-      headers: {
-        "authorization": `Bearer ${token}`,
-        "accept": "application/json",
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ agentId: "Credit2Credit Support" })
-    });
+    const upstream = await axios.post(
+      url.toString(),
+      { agentId: "Credit2Credit Support" },
+      {
+        httpsAgent,
+        timeout: 30000,
+        headers: {
+          authorization: `Bearer ${token}`,
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+        validateStatus: () => true,
+        responseType: "text",
+        transformResponse: (x) => x,
+      }
+    );
 
-    const text = await upstream.text();
-    res.status(upstream.status)
-      .set("content-type", upstream.headers.get("content-type") || "text/plain")
-      .send(text);
+    res
+      .status(upstream.status)
+      .set("content-type", upstream.headers["content-type"] || "text/plain")
+      .send(upstream.data);
   } catch (e) {
-    res.status(e.status || 500).json({ error: String(e.message || e), details: e.payload });
+    res.status(e.status || 500).json({ error: String(e?.message || e), details: e.payload });
   }
 });
 
@@ -159,11 +176,12 @@ app.all("/cd/*", async (req, res) => {
     if (!fixieUrl) return res.status(500).json({ error: "FIXIE_URL is not set" });
     if (!baseUrl) return res.status(500).json({ error: "CONSUMERDIRECT_BASE_URL is not set" });
 
-    const dispatcher = new ProxyAgent(fixieUrl);
+    const httpsAgent = new HttpsProxyAgent(fixieUrl);
 
     const targetPath = req.originalUrl.replace(/^\/cd/, "");
     const url = new URL(targetPath, baseUrl);
 
+    // Pass through only a few headers
     const headers = {};
     const passthrough = ["authorization", "content-type", "accept"];
     for (const h of passthrough) {
@@ -174,19 +192,22 @@ app.all("/cd/*", async (req, res) => {
     const hasBody = req.method !== "GET" && req.method !== "HEAD";
     if (hasBody && !headers["content-type"]) headers["content-type"] = "application/json";
 
-    const upstream = await undiciFetch(url.toString(), {
+    const upstream = await axios.request({
+      url: url.toString(),
       method: req.method,
+      httpsAgent,
+      timeout: 30000,
       headers,
-      body: hasBody ? req.body : undefined,
-      dispatcher
+      data: hasBody ? req.body : undefined, // Buffer from express.raw
+      validateStatus: () => true,
+      responseType: "arraybuffer",
     });
 
-    const text = await upstream.text();
-    res.status(upstream.status)
-      .set("content-type", upstream.headers.get("content-type") || "text/plain")
-      .send(text);
+    // Send upstream response back
+    const contentType = upstream.headers["content-type"] || "text/plain";
+    res.status(upstream.status).set("content-type", contentType).send(Buffer.from(upstream.data));
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
