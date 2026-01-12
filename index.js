@@ -5,10 +5,10 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 const app = express();
 app.use(express.raw({ type: "*/*", limit: "5mb" }));
 
-// ------------------ Public health check ------------------
+// ------------------ Public health check (no secret required) ------------------
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// ------------------ ONE SECRET ONLY (Base44 -> Render) ------------------
+// ------------------ Require internal secret for proxy routes ------------------
 function requireInternalSecret(req, res, next) {
   const expected = process.env.CD_PROXY_INTERNAL_SHARED_SECRET;
   if (!expected) {
@@ -17,9 +17,7 @@ function requireInternalSecret(req, res, next) {
     });
   }
 
-  // Base44 MUST send this header
   const provided = req.headers["x-cd-proxy-secret"];
-
   if (!provided || provided !== expected) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -37,144 +35,65 @@ function getHttpsAgent() {
   return new HttpsProxyAgent(fixieUrl);
 }
 
-// ------------------ ConsumerDirect token (cached) ------------------
-let cachedToken = null;
-let cachedTokenExpMs = 0;
+// Utility: copy request headers safely
+function buildForwardHeaders(req) {
+  const headers = {};
 
-async function getConsumerDirectToken(httpsAgent) {
-  const now = Date.now();
-  if (cachedToken && now < cachedTokenExpMs - 60_000) return { ok: true, token: cachedToken };
+  // Pass-through auth if present
+  if (req.headers["authorization"]) headers["authorization"] = req.headers["authorization"];
 
-  const clientId = process.env.CONSUMERDIRECT_CLIENT_ID;
-  const clientSecret = process.env.CONSUMERDIRECT_CLIENT_SECRET;
-  if (!clientId) throw new Error("CONSUMERDIRECT_CLIENT_ID is not set");
-  if (!clientSecret) throw new Error("CONSUMERDIRECT_CLIENT_SECRET is not set");
+  // Accept + content-type
+  headers["accept"] = req.headers["accept"] || "application/json";
+  if (req.headers["content-type"]) headers["content-type"] = req.headers["content-type"];
 
-  const tokenUrl = "https://auth.consumerdirect.io/oauth2/token";
-  const scope = process.env.CONSUMERDIRECT_SCOPE || "target-entity:e6c9113e-48b8-41ef-a87e-87a3c51a5e83";
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  // Optional pass-through for keys if you ever need them
+  if (req.headers["x-api-key"]) headers["x-api-key"] = req.headers["x-api-key"];
 
-  const body = new URLSearchParams();
-  body.set("grant_type", "client_credentials");
-  body.set("scope", scope);
-
-  const r = await axios.post(tokenUrl, body.toString(), {
-    httpsAgent,
-    timeout: 30000,
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      authorization: `Basic ${basic}`,
-    },
-    validateStatus: () => true,
-  });
-
-  if (r.status < 200 || r.status >= 300) {
-    return { ok: false, status: r.status, data: r.data };
-  }
-
-  const accessToken = r.data?.access_token;
-  const expiresIn = Number(r.data?.expires_in || 900);
-  if (!accessToken) return { ok: false, status: 500, data: r.data };
-
-  cachedToken = accessToken;
-  cachedTokenExpMs = Date.now() + expiresIn * 1000;
-
-  return { ok: true, token: accessToken, expiresIn };
+  return headers;
 }
 
-// Safe debug route: does NOT expose full token
-app.get("/cd-token-preview", async (req, res) => {
-  try {
-    const httpsAgent = getHttpsAgent();
-    const t = await getConsumerDirectToken(httpsAgent);
-    if (!t.ok) return res.status(t.status || 500).json({ error: "Token failed", details: t.data });
+async function forward(req, res, baseUrl, stripPrefix) {
+  const httpsAgent = getHttpsAgent();
 
-    res.json({ ok: true, access_token_preview: t.token.slice(0, 25) + "..." });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
+  const targetPath = req.originalUrl.replace(stripPrefix, ""); // keeps querystring
+  const url = new URL(targetPath, baseUrl);
 
-// ------------------ ConsumerDirect gateway: /cd/* forwards to ConsumerDirect ------------------
+  const hasBody = req.method !== "GET" && req.method !== "HEAD";
+
+  const upstream = await axios.request({
+    url: url.toString(),
+    method: req.method,
+    httpsAgent,
+    timeout: 30000,
+    headers: buildForwardHeaders(req),
+    data: hasBody ? req.body : undefined,
+    validateStatus: () => true,
+    responseType: "arraybuffer",
+  });
+
+  // Return upstream status + body
+  res
+    .status(upstream.status)
+    .set("content-type", upstream.headers["content-type"] || "application/octet-stream")
+    .send(Buffer.from(upstream.data));
+}
+
+// ------------------ ConsumerDirect PAPI passthrough: /cd/* ------------------
+// IMPORTANT: This does NOT fetch tokens. It simply forwards Authorization: Bearer <token>
 app.all("/cd/*", async (req, res) => {
   try {
-    const baseUrl = process.env.CONSUMERDIRECT_BASE_URL;
-    if (!baseUrl) return res.status(500).json({ error: "CONSUMERDIRECT_BASE_URL is not set" });
-
-    const httpsAgent = getHttpsAgent();
-    const tokenResp = await getConsumerDirectToken(httpsAgent);
-    if (!tokenResp.ok) return res.status(tokenResp.status || 500).json({ error: "Token failed", details: tokenResp.data });
-
-    const targetPath = req.originalUrl.replace(/^\/cd/, "");
-    const url = new URL(targetPath, baseUrl);
-
-    const headers = {
-      authorization: `Bearer ${tokenResp.token}`,
-      accept: req.headers["accept"] || "application/json",
-    };
-
-    const ct = req.headers["content-type"];
-    if (ct) headers["content-type"] = ct;
-
-    const hasBody = req.method !== "GET" && req.method !== "HEAD";
-
-    const upstream = await axios.request({
-      url: url.toString(),
-      method: req.method,
-      httpsAgent,
-      timeout: 30000,
-      headers,
-      data: hasBody ? req.body : undefined,
-      validateStatus: () => true,
-      responseType: "arraybuffer",
-    });
-
-    res
-      .status(upstream.status)
-      .set("content-type", upstream.headers["content-type"] || "application/octet-stream")
-      .send(Buffer.from(upstream.data));
+    const baseUrl = "https://papi.consumerdirect.io";
+    await forward(req, res, baseUrl, /^\/cd/);
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ------------------ SmartCredit gateway: /smartcredit/* forwards to SmartCredit ------------------
+// ------------------ SmartCredit passthrough: /smartcredit/* ------------------
 app.all("/smartcredit/*", async (req, res) => {
   try {
-    const smartBaseUrl = process.env.SMARTCREDIT_BASE_URL || "https://api.smartcredit.com";
-    const httpsAgent = getHttpsAgent();
-
-    const targetPath = req.originalUrl.replace(/^\/smartcredit/, "");
-    const url = new URL(targetPath, smartBaseUrl);
-
-    const headers = {
-      accept: req.headers["accept"] || "application/json",
-    };
-
-    const ct = req.headers["content-type"];
-    if (ct) headers["content-type"] = ct;
-
-    // Preserve auth headers
-    if (req.headers["authorization"]) headers["authorization"] = req.headers["authorization"];
-    if (req.headers["x-api-key"]) headers["x-api-key"] = req.headers["x-api-key"];
-
-    const hasBody = req.method !== "GET" && req.method !== "HEAD";
-
-    const upstream = await axios.request({
-      url: url.toString(),
-      method: req.method,
-      httpsAgent,
-      timeout: 30000,
-      headers,
-      data: hasBody ? req.body : undefined,
-      validateStatus: () => true,
-      responseType: "arraybuffer",
-    });
-
-    res
-      .status(upstream.status)
-      .set("content-type", upstream.headers["content-type"] || "application/octet-stream")
-      .send(Buffer.from(upstream.data));
+    const baseUrl = "https://api.smartcredit.com";
+    await forward(req, res, baseUrl, /^\/smartcredit/);
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
@@ -182,4 +101,4 @@ app.all("/smartcredit/*", async (req, res) => {
 
 // ------------------ Start server ------------------
 const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`C2C gateway running on port ${port}`));
+app.listen(port, () => console.log(`C2C proxy running on port ${port}`));
