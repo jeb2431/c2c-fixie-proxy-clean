@@ -7,123 +7,166 @@ const app = express();
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3000;
 
-// Fixie / outbound proxy (optional but likely required for your whitelisted IP)
-const FIXIE_URL = process.env.FIXIE_URL || null;
-
-// Shared secret required from Base44 backend calls
-const PROXY_SECRET =
+// Shared secret required from Base44 backend functions
+// Base44 sends: x-cd-proxy-secret: <value>
+const CD_PROXY_SECRET =
   process.env.CD_PROXY_INTERNAL_SHARED_SECRET ||
   process.env.CD_PROXY_SECRET ||
   "";
 
+// Fixie proxy (Render + Fixie)
+const FIXIE_URL = process.env.FIXIE_URL || "";
+
 // Upstreams
-// OTC + customer lookup endpoints come from PAPI
-const PAPI_BASE = "https://papi.consumerdirect.io";
-// SmartCredit “data” endpoints
-const SMARTCREDIT_BASE = "https://api.smartcredit.com";
+// IMPORTANT: This is where /cd/* should go (Partner API / PAPI host).
+// If Jon told you a different host for PAPI, put it here as an env var.
+// Default below is the most common pattern based on your previous work.
+const PAPI_BASE_URL = process.env.PAPI_BASE_URL || "https://papi.consumerdirect.io";
 
-// ---------- SAFETY ----------
-if (!PROXY_SECRET) {
-  console.error(
-    "ERROR: Missing proxy secret env var. Set CD_PROXY_INTERNAL_SHARED_SECRET or CD_PROXY_SECRET in Render."
-  );
-  process.exit(1);
-}
+// SmartCredit API base (JWT + data endpoints)
+const SMARTCREDIT_API_BASE_URL =
+  process.env.SMARTCREDIT_API_BASE_URL || "https://api.smartcredit.com";
 
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+// OAuth host (client_credentials)
+const AUTH_BASE_URL = process.env.AUTH_BASE_URL || "https://auth.consumerdirect.io";
 
-function requireProxySecret(req, res, next) {
-  const s = req.headers["x-cd-proxy-secret"];
-  if (!s || s !== PROXY_SECRET) {
-    return res.status(401).json({ ok: false, error: "Unauthorized proxy request" });
+// ---------- AXIOS INSTANCE ----------
+const axiosClient = axios.create({
+  timeout: 60_000,
+  maxBodyLength: Infinity,
+  maxContentLength: Infinity,
+  // Only apply Fixie agent if provided
+  httpsAgent: FIXIE_URL ? new HttpsProxyAgent(FIXIE_URL) : undefined,
+});
+
+// Need raw body sometimes (json + form + anything)
+app.use(express.raw({ type: "*/*", limit: "10mb" }));
+
+// ---------- SECURITY MIDDLEWARE ----------
+app.use((req, res, next) => {
+  // Health check can be open
+  if (req.path === "/health") return next();
+
+  if (!CD_PROXY_SECRET) {
+    return res.status(500).json({
+      ok: false,
+      error:
+        "Proxy missing CD_PROXY_INTERNAL_SHARED_SECRET / CD_PROXY_SECRET env var",
+    });
   }
+
+  const incoming = req.header("x-cd-proxy-secret");
+  if (!incoming || incoming !== CD_PROXY_SECRET) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized (missing/invalid x-cd-proxy-secret)",
+    });
+  }
+
   next();
-}
+});
 
-// Create axios client (optionally through Fixie)
-function axiosClient() {
-  if (FIXIE_URL) {
-    const agent = new HttpsProxyAgent(FIXIE_URL);
-    return axios.create({ httpsAgent: agent });
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    fixieEnabled: !!FIXIE_URL,
+    papiBase: PAPI_BASE_URL,
+    smartcreditBase: SMARTCREDIT_API_BASE_URL,
+    authBase: AUTH_BASE_URL,
+  });
+});
+
+// ---------- HELPER: FORWARD REQUEST ----------
+function filterHeaders(originalHeaders) {
+  // Remove hop-by-hop headers + our internal secret
+  const banned = new Set([
+    "host",
+    "connection",
+    "content-length",
+    "accept-encoding",
+    "x-cd-proxy-secret",
+  ]);
+
+  const out = {};
+  for (const [k, v] of Object.entries(originalHeaders || {})) {
+    const key = k.toLowerCase();
+    if (!banned.has(key)) out[k] = v;
   }
-  return axios.create();
+  return out;
 }
 
-// Generic forwarder
 async function forward(req, res, upstreamBase, stripPrefix) {
   try {
-    const client = axiosClient();
+    // Build upstream URL:
+    // Example:
+    // incoming:  /cd/v1/customers/..../otcs/login-as
+    // upstream:  https://papi.consumerdirect.io/v1/customers/..../otcs/login-as
+    const path = req.originalUrl.startsWith(stripPrefix)
+      ? req.originalUrl.slice(stripPrefix.length)
+      : req.originalUrl;
 
-    // Preserve query string
-    const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
+    const upstreamUrl = `${upstreamBase}${path}`;
 
-    // Rewrite path: remove stripPrefix from the front
-    // Example: /cd/v1/customers/...  -> /v1/customers/...
-    const upstreamPath = req.path.startsWith(stripPrefix)
-      ? req.path.slice(stripPrefix.length)
-      : req.path;
+    const headers = filterHeaders(req.headers);
 
-    const upstreamUrl = `${upstreamBase}${upstreamPath}${qs}`;
-
-    // Copy headers but remove hop-by-hop / internal headers
-    const headers = { ...req.headers };
-    delete headers.host;
-    delete headers["x-cd-proxy-secret"];
-    delete headers.connection;
-    delete headers["content-length"];
-
-    const method = req.method.toUpperCase();
-
-    const axiosResp = await client.request({
-      method,
+    const axiosResp = await axiosClient.request({
+      method: req.method,
       url: upstreamUrl,
       headers,
-      data: req.body,
-      validateStatus: () => true, // let us pass through errors
-      timeout: 60000,
+      data: req.body && req.body.length ? req.body : undefined,
+      validateStatus: () => true, // pass through status
     });
 
+    // Pass through
     res.status(axiosResp.status);
 
-    // Pass through content-type
-    if (axiosResp.headers && axiosResp.headers["content-type"]) {
+    // Copy content-type if present
+    if (axiosResp.headers?.["content-type"]) {
       res.setHeader("content-type", axiosResp.headers["content-type"]);
     }
 
-    // axiosResp.data may already be object
-    return res.send(axiosResp.data);
-  } catch (e) {
-    console.error("Proxy error:", e?.message || e);
-    return res.status(500).json({ ok: false, error: "Proxy failure", details: e?.message || String(e) });
+    // Return raw body
+    if (
+      Buffer.isBuffer(axiosResp.data) ||
+      typeof axiosResp.data === "string"
+    ) {
+      return res.send(axiosResp.data);
+    }
+
+    return res.json(axiosResp.data);
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: `Proxy exception: ${err?.message || String(err)}`,
+    });
   }
 }
 
 // ---------- ROUTES ----------
-// SmartCredit API (login + statement + metadata + 3bs)
-app.all("/smartcredit/*", requireProxySecret, async (req, res) => {
-  return forward(req, res, SMARTCREDIT_BASE, "/smartcredit");
-});
+// Partner API / PAPI routes (OTC should be here)
+app.use("/cd", (req, res) => forward(req, res, PAPI_BASE_URL, "/cd"));
 
-// ConsumerDirect PAPI (OTC + customer lookup)
-// Your Base44 function calls: /cd/v1/customers/{token}/otcs/login-as
-// This proxy forwards it to: https://papi.consumerdirect.io/v1/customers/{token}/otcs/login-as
-app.all("/cd/*", requireProxySecret, async (req, res) => {
-  return forward(req, res, PAPI_BASE, "/cd");
-});
+// SmartCredit API routes (login + data)
+app.use("/smartcredit", (req, res) =>
+  forward(req, res, SMARTCREDIT_API_BASE_URL, "/smartcredit")
+);
 
-// Health check
-app.get("/health", (req, res) => res.json({ ok: true }));
+// Auth routes (optional, but useful)
+app.use("/auth", (req, res) => forward(req, res, AUTH_BASE_URL, "/auth"));
 
-// Catch-all for debugging (helps when you hit a wrong route)
-app.all("*", (req, res) => {
+// Catch-all (helps debugging)
+app.use((req, res) => {
   res.status(404).json({
     ok: false,
-    error: `Proxy route not found: ${req.method} ${req.path}`,
-    hint: "Expected /cd/* or /smartcredit/*",
+    error: `Proxy route not found: ${req.method} ${req.originalUrl}`,
+    hint: "Expected /cd/* or /smartcredit/* or /auth/*",
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`Proxy listening on port ${PORT}`);
+  console.log(`✅ Proxy listening on port ${PORT}`);
+  console.log(`- Fixie enabled: ${!!FIXIE_URL}`);
+  console.log(`- /cd -> ${PAPI_BASE_URL}`);
+  console.log(`- /smartcredit -> ${SMARTCREDIT_API_BASE_URL}`);
+  console.log(`- /auth -> ${AUTH_BASE_URL}`);
 });
