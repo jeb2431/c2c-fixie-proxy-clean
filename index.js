@@ -3,102 +3,175 @@ import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
-app.use(express.raw({ type: "*/*", limit: "5mb" }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-// ------------------ Public health check (no secret required) ------------------
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+// =====================
+// REQUIRED ENV VARS
+// =====================
+const PORT = process.env.PORT || 3000;
 
-// ------------------ Require internal secret for proxy routes ------------------
-function requireInternalSecret(req, res, next) {
-  const expected = process.env.CD_PROXY_INTERNAL_SHARED_SECRET;
-  if (!expected) {
+// This must match what Base44 sends in header: x-cd-proxy-secret
+const PROXY_SHARED_SECRET =
+  process.env.CD_PROXY_INTERNAL_SHARED_SECRET ||
+  process.env.CD_PROXY_SECRET ||
+  "";
+
+// Fixie (optional but recommended if ConsumerDirect IP-whitelists you)
+const FIXIE_URL = process.env.FIXIE_URL || "";
+
+// Upstreams
+// PAPI (ConsumerDirect Partner API) - used for customer lookup + OTC generation
+const PAPI_BASE_URL = process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io";
+
+// SmartCredit API - used for /v1/login and the data endpoints
+// Jon told you "api.smartcredit.com"
+const SMARTCREDIT_BASE_URL = process.env.CD_SMARTCREDIT_BASE_URL || "https://api.smartcredit.com";
+
+if (!PROXY_SHARED_SECRET) {
+  console.error("Missing proxy secret env var: set CD_PROXY_INTERNAL_SHARED_SECRET or CD_PROXY_SECRET");
+}
+
+// Create axios client with optional Fixie agent
+function makeAxios() {
+  if (!FIXIE_URL) return axios;
+
+  const agent = new HttpsProxyAgent(FIXIE_URL);
+  return axios.create({
+    httpAgent: agent,
+    httpsAgent: agent,
+    timeout: 60_000,
+  });
+}
+
+const http = makeAxios();
+
+// =====================
+// AUTH GUARD
+// =====================
+function requireProxySecret(req, res, next) {
+  const got = req.headers["x-cd-proxy-secret"];
+  if (!PROXY_SHARED_SECRET) {
     return res.status(500).json({
-      error: "Server misconfigured: CD_PROXY_INTERNAL_SHARED_SECRET not set",
+      ok: false,
+      error: "Proxy not configured: missing CD_PROXY_INTERNAL_SHARED_SECRET/CD_PROXY_SECRET on Render",
     });
   }
-
-  const provided = req.headers["x-cd-proxy-secret"];
-  if (!provided || provided !== expected) {
-    return res.status(401).json({ error: "Unauthorized" });
+  if (!got || got !== PROXY_SHARED_SECRET) {
+    return res.status(401).json({ ok: false, error: "Unauthorized (bad proxy secret)" });
   }
-
   next();
 }
 
-// Everything below requires the shared secret
-app.use(requireInternalSecret);
+// =====================
+// HELPERS
+// =====================
+function pickHeaders(req) {
+  // forward important headers, but do NOT forward host
+  const allowed = [
+    "authorization",
+    "content-type",
+    "accept",
+    "user-agent",
+  ];
 
-// ------------------ Fixie agent ------------------
-function getHttpsAgent() {
-  const fixieUrl = process.env.FIXIE_URL;
-  if (!fixieUrl) throw new Error("FIXIE_URL is not set");
-  return new HttpsProxyAgent(fixieUrl);
+  const out = {};
+  for (const k of allowed) {
+    if (req.headers[k]) out[k] = req.headers[k];
+  }
+  return out;
 }
 
-// Utility: copy request headers safely
-function buildForwardHeaders(req) {
-  const headers = {};
+async function forward(req, res, baseUrl, rewritePrefix) {
+  try {
+    // original path includes rewritePrefix, remove it
+    const upstreamPath = req.originalUrl.startsWith(rewritePrefix)
+      ? req.originalUrl.slice(rewritePrefix.length)
+      : req.originalUrl;
 
-  // Pass-through auth if present
-  if (req.headers["authorization"]) headers["authorization"] = req.headers["authorization"];
+    const url = `${baseUrl}${upstreamPath}`;
 
-  // Accept + content-type
-  headers["accept"] = req.headers["accept"] || "application/json";
-  if (req.headers["content-type"]) headers["content-type"] = req.headers["content-type"];
+    const method = req.method.toUpperCase();
+    const headers = pickHeaders(req);
 
-  // Optional pass-through for keys if you ever need them
-  if (req.headers["x-api-key"]) headers["x-api-key"] = req.headers["x-api-key"];
+    // Body handling:
+    // - For JSON: req.body is object
+    // - For form-urlencoded: express.urlencoded makes it object too
+    // We’ll send raw JSON unless content-type is x-www-form-urlencoded, then send URLSearchParams.
+    let data = undefined;
+    const ct = (req.headers["content-type"] || "").toLowerCase();
 
-  return headers;
+    if (method !== "GET" && method !== "HEAD") {
+      if (ct.includes("application/x-www-form-urlencoded")) {
+        const params = new URLSearchParams();
+        for (const [k, v] of Object.entries(req.body || {})) {
+          params.set(k, String(v));
+        }
+        data = params.toString();
+      } else {
+        data = req.body;
+      }
+    }
+
+    const resp = await http.request({
+      url,
+      method,
+      headers,
+      data,
+      // IMPORTANT: return the upstream error body back to Base44
+      validateStatus: () => true,
+    });
+
+    res.status(resp.status);
+    // If upstream returns JSON, axios already parsed it sometimes; but keep safe:
+    return res.send(resp.data);
+  } catch (err) {
+    console.error("Proxy forward error:", err?.message || err);
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
 }
 
-async function forward(req, res, baseUrl, stripPrefix) {
-  const httpsAgent = getHttpsAgent();
+// =====================
+// ROUTES
+// =====================
 
-  const targetPath = req.originalUrl.replace(stripPrefix, ""); // keeps querystring
-  const url = new URL(targetPath, baseUrl);
+// Health check
+app.get("/", (_req, res) => res.json({
+  ok: true,
+  service: "c2c-fixie-proxy-clean",
+  papiBase: PAPI_BASE_URL,
+  smartcreditBase: SMARTCREDIT_BASE_URL,
+}));
 
-  const hasBody = req.method !== "GET" && req.method !== "HEAD";
+/**
+ * Base44 calls:
+ *   {CD_PROXY_URL}/cd/v1/...
+ * We forward to:
+ *   https://papi.consumerdirect.io/v1/...
+ */
+app.all("/cd/*", requireProxySecret, async (req, res) => {
+  return forward(req, res, PAPI_BASE_URL, "/cd");
+});
 
-  const upstream = await axios.request({
-    url: url.toString(),
-    method: req.method,
-    httpsAgent,
-    timeout: 30000,
-    headers: buildForwardHeaders(req),
-    data: hasBody ? req.body : undefined,
-    validateStatus: () => true,
-    responseType: "arraybuffer",
+/**
+ * Base44 calls:
+ *   {CD_PROXY_URL}/smartcredit/v1/...
+ * We forward to:
+ *   https://api.smartcredit.com/v1/...
+ */
+app.all("/smartcredit/*", requireProxySecret, async (req, res) => {
+  return forward(req, res, SMARTCREDIT_BASE_URL, "/smartcredit");
+});
+
+// Catch-all
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: `Proxy route not found: ${req.method} ${req.originalUrl}`,
+    hint: "Expected /cd/* or /smartcredit/*",
   });
-
-  // Return upstream status + body
-  res
-    .status(upstream.status)
-    .set("content-type", upstream.headers["content-type"] || "application/octet-stream")
-    .send(Buffer.from(upstream.data));
-}
-
-// ------------------ ConsumerDirect PAPI passthrough: /cd/* ------------------
-// IMPORTANT: This does NOT fetch tokens. It simply forwards Authorization: Bearer <token>
-app.all("/cd/*", async (req, res) => {
-  try {
-    const baseUrl = "https://papi.consumerdirect.io";
-    await forward(req, res, baseUrl, /^\/cd/);
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
 });
 
-// ------------------ SmartCredit passthrough: /smartcredit/* ------------------
-app.all("/smartcredit/*", async (req, res) => {
-  try {
-    const baseUrl = "https://api.smartcredit.com";
-    await forward(req, res, baseUrl, /^\/smartcredit/);
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
+app.listen(PORT, () => {
+  console.log(`Proxy listening on port ${PORT}`);
 });
-
-// ------------------ Start server ------------------
-const port = process.env.PORT || 10000;
-app.listen(port, () => console.log(`C2C proxy running on port ${port}`));
