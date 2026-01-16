@@ -1,6 +1,4 @@
-// index.js
-// FULL FILE — copy/paste this entire file into GitHub (replace everything), then commit + redeploy on Render.
-
+// index.js (FULL FILE)
 import express from "express";
 import { fetch as undiciFetch } from "undici";
 import { ProxyAgent } from "proxy-agent";
@@ -9,19 +7,15 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 10000;
-
 const UA = "Credit2Credit/1.0 (Render; Fixie; Proxy)";
 
-// IMPORTANT: Do NOT set HTTP_PROXY / HTTPS_PROXY in Render.
-// Only set FIXIE_URL (your authenticated Fixie proxy URL).
+// IMPORTANT: Only set FIXIE_URL in Render env.
+// Do NOT set HTTP_PROXY / HTTPS_PROXY in Render.
 const FIXIE_URL = process.env.FIXIE_URL || "";
-
-// Force outbound traffic through Fixie using undici dispatcher
 const dispatcher = FIXIE_URL ? new ProxyAgent(FIXIE_URL) : undefined;
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Shows whether FIXIE_URL is present and whether we are using the proxy dispatcher
 app.get("/debug/proxy", (req, res) => {
   res.json({
     ok: true,
@@ -31,33 +25,79 @@ app.get("/debug/proxy", (req, res) => {
   });
 });
 
-// Proves the egress IP (should be 52.5.155.132 or 52.87.82.133)
+// Try multiple endpoints so we can diagnose if one site is blocked.
+// Also returns real error details (message, name, cause, stack preview).
 app.get("/debug/ip", async (req, res) => {
-  try {
-    const r = await undiciFetch("https://api.ipify.org?format=json", {
-      method: "GET",
-      headers: { accept: "application/json", "user-agent": UA },
-      dispatcher, // <-- THE KEY: routes through Fixie
-    });
+  const targets = [
+    "https://api.ipify.org?format=json",
+    "https://ifconfig.me/all.json",
+    "https://ipinfo.io/json",
+  ];
 
-    const text = await r.text();
-    let json;
+  const results = [];
+
+  for (const url of targets) {
     try {
-      json = JSON.parse(text);
-    } catch {
-      json = { raw: text };
-    }
+      const r = await undiciFetch(url, {
+        method: "GET",
+        headers: { accept: "application/json", "user-agent": UA },
+        dispatcher,
+      });
 
-    res.json({
-      ok: true,
-      status: r.status,
-      ip: json.ip || null,
-      viaFixie: !!dispatcher,
-      raw: json.raw || null,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+      const text = await r.text();
+      let json;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = { raw: text };
+      }
+
+      const ip =
+        json.ip ||
+        json.IPv4 ||
+        json.address ||
+        json.query ||
+        (json.ipinfo && json.ipinfo.ip) ||
+        null;
+
+      results.push({
+        url,
+        ok: r.ok,
+        status: r.status,
+        ip,
+        bodyPreview: text?.slice(0, 200) || null,
+      });
+
+      // If we got an IP, we can stop early.
+      if (ip) {
+        return res.json({
+          ok: true,
+          viaFixie: !!dispatcher,
+          ip,
+          results,
+        });
+      }
+    } catch (e) {
+      results.push({
+        url,
+        ok: false,
+        error: {
+          name: e?.name || null,
+          message: e?.message || String(e),
+          cause: e?.cause ? String(e.cause) : null,
+          stack: (e?.stack || "").split("\n").slice(0, 5).join("\n") || null,
+        },
+      });
+    }
   }
+
+  // If none worked, return diagnostics
+  return res.status(502).json({
+    ok: false,
+    viaFixie: !!dispatcher,
+    error: "All IP endpoints failed via proxy",
+    results,
+  });
 });
 
 app.listen(PORT, () => {
