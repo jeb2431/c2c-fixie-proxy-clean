@@ -1,6 +1,9 @@
+// index.js
+// FULL FILE — copy/paste this entire file into GitHub (replace everything), then commit + redeploy on Render.
+
 import express from "express";
 import { fetch as undiciFetch } from "undici";
-import ProxyAgent from "proxy-agent";
+import { ProxyAgent } from "proxy-agent";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -9,15 +12,16 @@ const PORT = process.env.PORT || 10000;
 
 const UA = "Credit2Credit/1.0 (Render; Fixie; Proxy)";
 
-// We ONLY use FIXIE_URL at runtime (do NOT set HTTP_PROXY/HTTPS_PROXY in Render env)
+// IMPORTANT: Do NOT set HTTP_PROXY / HTTPS_PROXY in Render.
+// Only set FIXIE_URL (your authenticated Fixie proxy URL).
 const FIXIE_URL = process.env.FIXIE_URL || "";
 
-// Create a dispatcher (agent) that forces outbound traffic through Fixie
+// Force outbound traffic through Fixie using undici dispatcher
 const dispatcher = FIXIE_URL ? new ProxyAgent(FIXIE_URL) : undefined;
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Debug: confirm whether proxy is actually configured
+// Shows whether FIXIE_URL is present and whether we are using the proxy dispatcher
 app.get("/debug/proxy", (req, res) => {
   res.json({
     ok: true,
@@ -27,18 +31,22 @@ app.get("/debug/proxy", (req, res) => {
   });
 });
 
-// Debug: prove outbound IP (this MUST be 52.5.155.132 or 52.87.82.133)
+// Proves the egress IP (should be 52.5.155.132 or 52.87.82.133)
 app.get("/debug/ip", async (req, res) => {
   try {
     const r = await undiciFetch("https://api.ipify.org?format=json", {
       method: "GET",
       headers: { accept: "application/json", "user-agent": UA },
-      dispatcher, // <-- THE KEY LINE: forces Fixie
+      dispatcher, // <-- THE KEY: routes through Fixie
     });
 
     const text = await r.text();
     let json;
-    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = { raw: text };
+    }
 
     res.json({
       ok: true,
