@@ -1,19 +1,100 @@
-// index.js (FULL FILE) — Fixie via https-proxy-agent (reliable)
-
 import express from "express";
+import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 10000;
-const UA = "Credit2Credit/1.0 (Render; Fixie; Proxy)";
 
-// Only set FIXIE_URL in Render env (leave HTTP_PROXY/HTTPS_PROXY unset)
-const FIXIE_URL = process.env.FIXIE_URL || "";
+// ===== ENV =====
+const FIXIE_URL = process.env.FIXIE_URL || ""; // e.g. http://fixie:pass@criterium.usefixie.com:80
+const PROXY_API_KEY = process.env.PROXY_API_KEY || ""; // shared secret between Base44 and this proxy
+const CONSUMERDIRECT_BASE_URL = process.env.CONSUMERDIRECT_BASE_URL || "https://papi.consumerdirect.io";
+const CD_SMARTCREDIT_BASE_URL = process.env.CD_SMARTCREDIT_BASE_URL || "https://api.smartcredit.com";
 
-// Create a standard HTTPS proxy agent for Node fetch()
+const UA = "Credit2Credit/1.0 (Render; Fixie; Server-to-Server)";
+
 const proxyAgent = FIXIE_URL ? new HttpsProxyAgent(FIXIE_URL) : null;
+
+// ===== helpers =====
+function maskFixie(url) {
+  if (!url) return null;
+  return url.replace(/:\/\/.*@/, "://****:****@");
+}
+
+function requireSecret(req, res) {
+  if (!PROXY_API_KEY) {
+    res.status(500).json({ ok: false, error: "PROXY_API_KEY not set on Render" });
+    return false;
+  }
+  const incoming = req.headers["x-cd-proxy-secret"];
+  if (!incoming || incoming !== PROXY_API_KEY) {
+    res.status(401).json({ ok: false, error: "Unauthorized (missing/invalid x-cd-proxy-secret)" });
+    return false;
+  }
+  return true;
+}
+
+function cleanForwardHeaders(reqHeaders) {
+  const h = { ...reqHeaders };
+
+  // remove hop-by-hop + things we should not forward
+  delete h.host;
+  delete h.connection;
+  delete h["content-length"];
+
+  // normalize UA
+  h["user-agent"] = UA;
+
+  return h;
+}
+
+async function forward(req, res, targetBase, stripPrefix) {
+  if (!requireSecret(req, res)) return;
+
+  const path = req.originalUrl.replace(stripPrefix, "");
+  const url = targetBase.replace(/\/$/, "") + path;
+
+  const headers = cleanForwardHeaders(req.headers);
+
+  // Special mapping: if Base44 sends x-cd-authorization, convert to Authorization before forwarding
+  if (headers["x-cd-authorization"] && !headers["authorization"]) {
+    headers["authorization"] = headers["x-cd-authorization"];
+  }
+  delete headers["x-cd-authorization"];
+
+  try {
+    const ax = await axios.request({
+      url,
+      method: req.method,
+      headers,
+      data: req.body,
+      timeout: 30000,
+      // IMPORTANT: this forces outbound traffic through Fixie
+      httpsAgent: proxyAgent || undefined,
+      httpAgent: proxyAgent || undefined,
+      validateStatus: () => true
+    });
+
+    // return status + body
+    res.status(ax.status);
+
+    // pass through a couple safe headers (optional)
+    if (ax.headers["content-type"]) res.setHeader("content-type", ax.headers["content-type"]);
+
+    // axios may give object or string
+    return res.send(ax.data);
+  } catch (e) {
+    return res.status(502).json({
+      ok: false,
+      error: "Proxy forward failed",
+      message: e?.message || String(e)
+    });
+  }
+}
+
+// ===== routes =====
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -22,11 +103,15 @@ app.get("/debug/proxy", (req, res) => {
     ok: true,
     hasFixieUrl: !!FIXIE_URL,
     usingProxy: !!proxyAgent,
-    fixieUrlMasked: FIXIE_URL ? FIXIE_URL.replace(/:\/\/.*@/, "://****:****@") : null
+    fixieUrlMasked: maskFixie(FIXIE_URL),
+    consumerDirectBase: CONSUMERDIRECT_BASE_URL,
+    smartCreditBase: CD_SMARTCREDIT_BASE_URL,
+    hasProxyApiKey: !!PROXY_API_KEY
   });
 });
 
-// This will prove the egress IP using Node fetch through Fixie.
+// This checks what IP the WORLD sees for your Render service when it goes OUTBOUND.
+// This MUST show 52.5.155.132 or 52.87.82.133 for OTC to work.
 app.get("/debug/ip", async (req, res) => {
   const targets = [
     "https://api.ipify.org?format=json",
@@ -38,50 +123,38 @@ app.get("/debug/ip", async (req, res) => {
 
   for (const url of targets) {
     try {
-      const r = await fetch(url, {
-        method: "GET",
-        headers: { "accept": "application/json", "user-agent": UA },
-        // Node fetch (undici) supports dispatcher internally, but proxy agents work via undici global dispatcher
-        // The most reliable approach here is to use the "agent" option supported by Node fetch for HTTP(S).
-        agent: proxyAgent || undefined
+      const ax = await axios.get(url, {
+        headers: { accept: "application/json", "user-agent": UA },
+        timeout: 20000,
+        httpsAgent: proxyAgent || undefined,
+        httpAgent: proxyAgent || undefined,
+        validateStatus: () => true
       });
 
-      const text = await r.text();
-      let json;
-      try { json = JSON.parse(text); } catch { json = { raw: text }; }
-
+      const data = ax.data;
       const ip =
-        json.ip ||
-        json.IPv4 ||
-        json.address ||
-        json.query ||
+        data?.ip ||
+        data?.IPv4 ||
+        data?.address ||
+        data?.query ||
         null;
 
       results.push({
         url,
-        ok: r.ok,
-        status: r.status,
+        ok: ax.status >= 200 && ax.status < 300,
+        status: ax.status,
         ip,
-        bodyPreview: text.slice(0, 200)
+        preview: typeof data === "string" ? data.slice(0, 120) : data
       });
 
       if (ip) {
-        return res.json({
-          ok: true,
-          viaFixie: !!proxyAgent,
-          ip,
-          results
-        });
+        return res.json({ ok: true, viaFixie: !!proxyAgent, ip, results });
       }
     } catch (e) {
       results.push({
         url,
         ok: false,
-        error: {
-          name: e?.name || null,
-          message: e?.message || String(e),
-          stack: (e?.stack || "").split("\n").slice(0, 5).join("\n") || null
-        }
+        error: e?.message || String(e)
       });
     }
   }
@@ -94,6 +167,13 @@ app.get("/debug/ip", async (req, res) => {
   });
 });
 
+// ConsumerDirect (PAPI) proxy
+app.all("/cd/*", (req, res) => forward(req, res, CONSUMERDIRECT_BASE_URL, "/cd"));
+
+// SmartCredit proxy
+app.all("/smartcredit/*", (req, res) => forward(req, res, CD_SMARTCREDIT_BASE_URL, "/smartcredit"));
+
 app.listen(PORT, () => {
-  console.log(`Proxy listening on :${PORT} (Fixie=${proxyAgent ? "ON" : "OFF"})`);
+  console.log(`Proxy listening on :${PORT}`);
+  console.log(`Fixie: ${proxyAgent ? "ON" : "OFF"} (${maskFixie(FIXIE_URL)})`);
 });
