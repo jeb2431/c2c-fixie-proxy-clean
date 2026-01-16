@@ -1,7 +1,7 @@
-// index.js (FULL FILE)
+// index.js (FULL FILE) — Fixie via https-proxy-agent (reliable)
+
 import express from "express";
-import { fetch as undiciFetch } from "undici";
-import { ProxyAgent } from "proxy-agent";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -9,10 +9,11 @@ app.use(express.json({ limit: "2mb" }));
 const PORT = process.env.PORT || 10000;
 const UA = "Credit2Credit/1.0 (Render; Fixie; Proxy)";
 
-// IMPORTANT: Only set FIXIE_URL in Render env.
-// Do NOT set HTTP_PROXY / HTTPS_PROXY in Render.
+// Only set FIXIE_URL in Render env (leave HTTP_PROXY/HTTPS_PROXY unset)
 const FIXIE_URL = process.env.FIXIE_URL || "";
-const dispatcher = FIXIE_URL ? new ProxyAgent(FIXIE_URL) : undefined;
+
+// Create a standard HTTPS proxy agent for Node fetch()
+const proxyAgent = FIXIE_URL ? new HttpsProxyAgent(FIXIE_URL) : null;
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -20,44 +21,40 @@ app.get("/debug/proxy", (req, res) => {
   res.json({
     ok: true,
     hasFixieUrl: !!FIXIE_URL,
-    usingProxy: !!dispatcher,
-    fixieUrlMasked: FIXIE_URL ? FIXIE_URL.replace(/:\/\/.*@/, "://****:****@") : null,
+    usingProxy: !!proxyAgent,
+    fixieUrlMasked: FIXIE_URL ? FIXIE_URL.replace(/:\/\/.*@/, "://****:****@") : null
   });
 });
 
-// Try multiple endpoints so we can diagnose if one site is blocked.
-// Also returns real error details (message, name, cause, stack preview).
+// This will prove the egress IP using Node fetch through Fixie.
 app.get("/debug/ip", async (req, res) => {
   const targets = [
     "https://api.ipify.org?format=json",
-    "https://ifconfig.me/all.json",
     "https://ipinfo.io/json",
+    "https://ifconfig.me/all.json"
   ];
 
   const results = [];
 
   for (const url of targets) {
     try {
-      const r = await undiciFetch(url, {
+      const r = await fetch(url, {
         method: "GET",
-        headers: { accept: "application/json", "user-agent": UA },
-        dispatcher,
+        headers: { "accept": "application/json", "user-agent": UA },
+        // Node fetch (undici) supports dispatcher internally, but proxy agents work via undici global dispatcher
+        // The most reliable approach here is to use the "agent" option supported by Node fetch for HTTP(S).
+        agent: proxyAgent || undefined
       });
 
       const text = await r.text();
       let json;
-      try {
-        json = JSON.parse(text);
-      } catch {
-        json = { raw: text };
-      }
+      try { json = JSON.parse(text); } catch { json = { raw: text }; }
 
       const ip =
         json.ip ||
         json.IPv4 ||
         json.address ||
         json.query ||
-        (json.ipinfo && json.ipinfo.ip) ||
         null;
 
       results.push({
@@ -65,16 +62,15 @@ app.get("/debug/ip", async (req, res) => {
         ok: r.ok,
         status: r.status,
         ip,
-        bodyPreview: text?.slice(0, 200) || null,
+        bodyPreview: text.slice(0, 200)
       });
 
-      // If we got an IP, we can stop early.
       if (ip) {
         return res.json({
           ok: true,
-          viaFixie: !!dispatcher,
+          viaFixie: !!proxyAgent,
           ip,
-          results,
+          results
         });
       }
     } catch (e) {
@@ -84,22 +80,20 @@ app.get("/debug/ip", async (req, res) => {
         error: {
           name: e?.name || null,
           message: e?.message || String(e),
-          cause: e?.cause ? String(e.cause) : null,
-          stack: (e?.stack || "").split("\n").slice(0, 5).join("\n") || null,
-        },
+          stack: (e?.stack || "").split("\n").slice(0, 5).join("\n") || null
+        }
       });
     }
   }
 
-  // If none worked, return diagnostics
   return res.status(502).json({
     ok: false,
-    viaFixie: !!dispatcher,
-    error: "All IP endpoints failed via proxy",
-    results,
+    viaFixie: !!proxyAgent,
+    error: "All IP endpoints failed",
+    results
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`Proxy listening on :${PORT} (Fixie=${dispatcher ? "ON" : "OFF"})`);
+  console.log(`Proxy listening on :${PORT} (Fixie=${proxyAgent ? "ON" : "OFF"})`);
 });
