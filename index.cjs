@@ -1,160 +1,201 @@
 /**
  * index.cjs — C2C Fixie Proxy (CommonJS)
  *
- * PURPOSE
- * - Secure proxy for ConsumerDirect / SmartCredit APIs
- * - Uses Fixie (static IP) if FIXIE_URL is set
- * - Protects with x-proxy-api-key
- * - FIXES core bug: incoming /papi/... → upstream /v1/... (strips /papi)
- *
- * REQUIRED ENV VARS (Render):
+ * REQUIRED env:
  *   PORT
  *   PROXY_API_KEY
- *   CD_PAPI_PROD_CLIENT_ID
- *   CD_PAPI_PROD_CLIENT_SECRET
  *
- * OPTIONAL:
+ * OPTIONAL env:
  *   FIXIE_URL
- *   CD_AUTH_BASE_URL (default https://auth.consumerdirect.io)
- *   CD_PAPI_BASE_URL (default https://papi.consumerdirect.io)
  */
 
 const express = require("express");
-const { ProxyAgent, setGlobalDispatcher, fetch } = require("undici");
+const { ProxyAgent, setGlobalDispatcher, fetch, Headers } = require("undici");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: false }));
 
-/* =========================
-   ENV
-========================= */
+// --- Fixie support (optional) ---
+const FIXIE_URL = process.env.FIXIE_URL;
+if (FIXIE_URL) {
+  try {
+    const agent = new ProxyAgent(FIXIE_URL);
+    setGlobalDispatcher(agent);
+    console.log("[proxy] FIXIE_URL enabled");
+  } catch (e) {
+    console.log("[proxy] FIXIE_URL failed to initialize:", e?.message || e);
+  }
+}
+
+// --- Config ---
 const PORT = process.env.PORT || 10000;
 const PROXY_API_KEY = process.env.PROXY_API_KEY;
 
-const AUTH_BASE =
-  process.env.CD_AUTH_BASE_URL || "https://auth.consumerdirect.io";
-const PAPI_BASE =
-  process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io";
-
-const CLIENT_ID = process.env.CD_PAPI_PROD_CLIENT_ID;
-const CLIENT_SECRET = process.env.CD_PAPI_PROD_CLIENT_SECRET;
-
-/* =========================
-   FIXIE SUPPORT
-========================= */
-if (process.env.FIXIE_URL) {
-  const agent = new ProxyAgent(process.env.FIXIE_URL);
-  setGlobalDispatcher(agent);
-  console.log("[proxy] FIXIE enabled");
+if (!PROXY_API_KEY) {
+  console.log("[proxy] WARNING: PROXY_API_KEY is not set");
 }
 
-/* =========================
-   SECURITY MIDDLEWARE
-========================= */
-app.use((req, res, next) => {
-  if (!PROXY_API_KEY) {
-    return res.status(500).json({ error: "PROXY_API_KEY not set on server" });
-  }
+// body parsers
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true }));
 
+// --- auth middleware ---
+function requireProxyKey(req, res, next) {
   const key = req.headers["x-proxy-api-key"];
-  if (key !== PROXY_API_KEY) {
-    return res.status(401).json({ error: "Invalid proxy API key" });
+  if (!PROXY_API_KEY) {
+    return res.status(500).json({ ok: false, error: "PROXY_API_KEY_NOT_SET_ON_SERVER" });
+  }
+  if (!key || key !== PROXY_API_KEY) {
+    return res.status(401).json({ ok: false, error: "UNAUTHORIZED_PROXY_KEY" });
+  }
+  next();
+}
+
+// --- helpers ---
+async function readTextSafe(r) {
+  try {
+    return await r.text();
+  } catch {
+    return "";
+  }
+}
+
+function pickHeaders(incomingHeaders) {
+  // Start with incoming headers, but strip hop-by-hop + proxy secret header
+  const h = new Headers();
+  for (const [k, v] of Object.entries(incomingHeaders || {})) {
+    const key = k.toLowerCase();
+    if (
+      key === "host" ||
+      key === "connection" ||
+      key === "content-length" ||
+      key === "accept-encoding" ||
+      key === "x-proxy-api-key"
+    ) {
+      continue;
+    }
+    if (typeof v !== "undefined") h.set(key, v);
+  }
+  // always set a UA so upstream doesn’t block “unknown”
+  if (!h.get("user-agent")) h.set("user-agent", "Credit2Credit/1.0 (Render Proxy)");
+  return h;
+}
+
+async function forward({ method, url, headers, body }) {
+  const h = pickHeaders(headers);
+
+  const opts = { method, headers: h };
+
+  // Only attach body for methods that allow it
+  if (body != null && !["GET", "HEAD"].includes(method.toUpperCase())) {
+    opts.body = body;
   }
 
-  next();
+  const t0 = Date.now();
+  const r = await fetch(url, opts);
+  const ms = Date.now() - t0;
+
+  const text = await readTextSafe(r);
+
+  return {
+    ok: r.ok,
+    status: r.status,
+    ms,
+    headers: Object.fromEntries(r.headers.entries()),
+    body: text,
+  };
+}
+
+// --- routes ---
+
+// Health endpoint so you can validate proxy is alive.
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "c2c-fixie-proxy-clean", hasFixie: !!FIXIE_URL });
 });
 
-/* =========================
-   HEALTH CHECK
-========================= */
-app.get("/", (_req, res) => {
-  res.status(200).send("ok");
-});
-
-/* =========================
-   OAUTH TOKEN ENDPOINT
-   POST /oauth/token
-========================= */
-app.post("/oauth/token", async (_req, res) => {
+// Your existing token passthrough (kept simple)
+app.post("/oauth/token", requireProxyKey, async (req, res) => {
   try {
-    if (!CLIENT_ID || !CLIENT_SECRET) {
-      return res.status(500).json({
-        error: "Missing CD_PAPI_PROD_CLIENT_ID or CD_PAPI_PROD_CLIENT_SECRET",
-      });
+    // You’re currently using this as a “smoke test”.
+    // If you want this to always target auth.consumerdirect.io, do it here.
+    // Otherwise leave as-is and let Base44 call auth directly (but through proxy).
+    const targetUrl = "https://auth.consumerdirect.io/oauth2/token";
+
+    // If caller sent x-www-form-urlencoded, keep it.
+    const contentType = (req.headers["content-type"] || "").toLowerCase();
+    let body;
+    let headers = req.headers;
+
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      body = req.body && typeof req.body === "object" ? new URLSearchParams(req.body).toString() : "";
+    } else if (typeof req.body === "string") {
+      body = req.body;
+    } else {
+      // default minimal
+      body = "grant_type=client_credentials";
+      headers = { ...headers, "content-type": "application/x-www-form-urlencoded" };
     }
 
-    const body = new URLSearchParams();
-    body.set("grant_type", "client_credentials");
-
-    const auth = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString(
-      "base64"
-    );
-
-    const r = await fetch(`${AUTH_BASE}/oauth2/token`, {
+    const out = await forward({
       method: "POST",
-      headers: {
-        Authorization: `Basic ${auth}`,
-        "content-type": "application/x-www-form-urlencoded",
-      },
+      url: targetUrl,
+      headers,
       body,
     });
 
-    const text = await r.text();
-    res.status(r.status).send(text);
-  } catch (err) {
-    console.error("[oauth/token]", err);
-    res.status(500).json({ error: "OAuth token error" });
+    res.status(out.status);
+    // pass-through content-type if present
+    const ct = out.headers["content-type"];
+    if (ct) res.setHeader("content-type", ct);
+    return res.send(out.body);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "OAUTH_PROXY_ERROR", message: String(e?.message || e) });
   }
 });
 
-/* =========================
-   PAPI PROXY
-   /papi/...  →  upstream /v1/...
-========================= */
-app.use("/papi", async (req, res) => {
+/**
+ * Generic forwarder:
+ * POST /raw
+ * Headers: x-proxy-api-key: <PROXY_API_KEY>
+ * Body JSON:
+ * {
+ *   "method": "GET|POST|PUT|DELETE|PATCH|OPTIONS",
+ *   "url": "https://whatever.host/path",
+ *   "headers": { ...optional headers... },
+ *   "body": "string body"  // optional
+ * }
+ */
+app.post("/raw", requireProxyKey, async (req, res) => {
   try {
-    // STRIP /papi from path
-    const upstreamPath = req.originalUrl.replace(/^\/papi/, "");
-    const upstreamUrl = `${PAPI_BASE}${upstreamPath}`;
-
-    const headers = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (
-        k.toLowerCase() === "host" ||
-        k.toLowerCase() === "x-proxy-api-key" ||
-        k.toLowerCase() === "content-length"
-      ) {
-        continue;
-      }
-      headers[k] = v;
+    const { method, url, headers, body } = req.body || {};
+    if (!method || !url) {
+      return res.status(400).json({ ok: false, error: "MISSING_METHOD_OR_URL" });
     }
 
-    const r = await fetch(upstreamUrl, {
-      method: req.method,
-      headers,
-      body:
-        req.method === "GET" || req.method === "HEAD"
-          ? undefined
-          : JSON.stringify(req.body),
+    const out = await forward({
+      method,
+      url,
+      headers: headers || req.headers,
+      body: body ?? null,
     });
 
-    res.status(r.status);
-    r.headers.forEach((value, key) => {
-      res.setHeader(key, value);
+    // Return upstream response as JSON so Base44 can parse it reliably.
+    return res.status(200).json({
+      ok: true,
+      upstream: {
+        ok: out.ok,
+        status: out.status,
+        ms: out.ms,
+        content_type: out.headers["content-type"] || null,
+        // body can be huge; Base44 preview is enough
+        body_preview: out.body ? out.body.slice(0, 2000) : "",
+        headers: out.headers,
+      },
     });
-
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.send(buf);
-  } catch (err) {
-    console.error("[papi proxy]", err);
-    res.status(500).json({ error: "Proxy error" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "RAW_PROXY_ERROR", message: String(e?.message || e) });
   }
 });
 
-/* =========================
-   START SERVER
-========================= */
 app.listen(PORT, () => {
-  console.log(`[proxy] listening on :${PORT}`);
+  console.log(`[proxy] listening on ${PORT}`);
 });
