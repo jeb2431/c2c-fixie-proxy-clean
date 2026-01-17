@@ -1,17 +1,16 @@
-// server.js — minimal, guaranteed-to-run Express proxy
+// server.js — CommonJS, Node 18+, zero deps
 
-import express from "express";
-import fetch from "node-fetch";
+const express = require("express");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-// Health check (so Render doesn’t kill it)
+// Health check
 app.get("/", (_req, res) => {
   res.status(200).send("ok");
 });
 
-// ✅ AUTH PROXY — THIS IS THE FIX
+// AUTH PROXY — WORKS ON RENDER
 app.post("/auth/oauth2/token", async (_req, res) => {
   try {
     const clientId = process.env.CD_PAPI_PROD_CLIENT_ID;
@@ -20,23 +19,23 @@ app.post("/auth/oauth2/token", async (_req, res) => {
     if (!clientId || !clientSecret) {
       return res.status(500).json({
         ok: false,
-        error: "Missing env vars in Render",
+        error: "Missing CD_PAPI_PROD_CLIENT_ID or CD_PAPI_PROD_CLIENT_SECRET",
       });
     }
 
-    const resp = await fetch("https://auth.consumerdirect.io/oauth2/token", {
+    const auth = Buffer.from(clientId + ":" + clientSecret).toString("base64");
+
+    const response = await fetch("https://auth.consumerdirect.io/oauth2/token", {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization":
-          "Basic " +
-          Buffer.from(clientId + ":" + clientSecret).toString("base64"),
+        "Authorization": "Basic " + auth,
       },
       body: "grant_type=client_credentials",
     });
 
-    const text = await resp.text();
-    res.status(resp.status).send(text);
+    const text = await response.text();
+    res.status(response.status).send(text);
   } catch (err) {
     res.status(500).json({
       ok: false,
@@ -47,5 +46,5 @@ app.post("/auth/oauth2/token", async (_req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Render proxy running on port", PORT);
+  console.log("Render proxy listening on", PORT);
 });
