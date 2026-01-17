@@ -1,219 +1,237 @@
-// index.cjs — CommonJS proxy (works even if package.json has "type": "module")
+/**
+ * index.cjs — C2C Fixie Proxy (CommonJS)
+ * - Works even if package.json has "type": "module" because this file is .cjs
+ * - Protects proxy with x-proxy-api-key
+ * - Uses Fixie if FIXIE_URL is set
+ * - Fixes the core bug: incoming /papi/... MUST forward to upstream /... (strip /papi)
+ *
+ * Expected env vars on Render:
+ *   PORT
+ *   PROXY_API_KEY                         (required)
+ *   FIXIE_URL                             (optional)
+ *
+ *   CD_AUTH_BASE_URL   (default: https://auth.consumerdirect.io)
+ *   CD_PAPI_BASE_URL   (default: https://papi.consumerdirect.io)
+ *
+ *   CD_PAPI_PROD_CLIENT_ID
+ *   CD_PAPI_PROD_CLIENT_SECRET
+ *   CD_SCOPE (optional)
+ *
+ * Optional:
+ *   ALLOWED_ORIGINS (comma-separated)
+ */
 
 const express = require("express");
-const { ProxyAgent, setGlobalDispatcher } = require("undici");
+const { ProxyAgent, setGlobalDispatcher, fetch, Headers } = require("undici");
 
 const app = express();
+
+// ---------- Body parsing ----------
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: false }));
 
-// -------------------------
-// ENV
-// -------------------------
+// ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
 
-// ConsumerDirect endpoints
+const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
+const FIXIE_URL = process.env.FIXIE_URL || "";
+
+// ConsumerDirect bases
 const AUTH_BASE = process.env.CD_AUTH_BASE_URL || "https://auth.consumerdirect.io";
 const PAPI_BASE = process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io";
 
-// Credentials (PAPI OAuth)
-const CLIENT_ID = process.env.CD_PAPI_PROD_CLIENT_ID;
-const CLIENT_SECRET = process.env.CD_PAPI_PROD_CLIENT_SECRET;
-
-// Optional scope (only if your account requires it)
+// OAuth client credentials (PAPI)
+const CLIENT_ID = process.env.CD_PAPI_PROD_CLIENT_ID || "";
+const CLIENT_SECRET = process.env.CD_PAPI_PROD_CLIENT_SECRET || "";
 const CD_SCOPE = process.env.CD_SCOPE || "";
 
-// Security for calling THIS proxy (Base44 should send this)
-const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
-
-// CORS allowlist (comma-separated)
+// CORS allowlist (optional)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Fixie proxy (optional but recommended if whitelisting requires static IP)
-const FIXIE_URL = process.env.FIXIE_URL || "";
-
-// If FIXIE_URL is set, route ALL outgoing fetch() through Fixie (Undici)
+// ---------- Fixie via undici ----------
 if (FIXIE_URL) {
   try {
     setGlobalDispatcher(new ProxyAgent(FIXIE_URL));
     console.log("[proxy] FIXIE enabled");
   } catch (e) {
-    console.log("[proxy] FIXIE init failed:", e?.message || e);
+    console.log("[proxy] FIXIE failed to init:", String(e?.message || e));
   }
+} else {
+  console.log("[proxy] FIXIE not set");
 }
 
-// -------------------------
-// Helpers
-// -------------------------
-function setCors(req, res) {
+// ---------- Helpers ----------
+function sendCors(req, res) {
   const origin = req.headers.origin;
   if (!origin) return;
-
   if (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Proxy-Api-Key, Authorization");
+    res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, x-proxy-api-key");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
   }
 }
 
 function requireProxyKey(req, res) {
-  if (!PROXY_API_KEY) return true; // if you haven't set one, don't block
-
-  const key =
-    req.headers["x-proxy-api-key"] ||
-    (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")
-      ? req.headers.authorization.slice("Bearer ".length)
-      : "");
-
-  if (key !== PROXY_API_KEY) {
+  const key = req.headers["x-proxy-api-key"];
+  if (!PROXY_API_KEY) {
+    res.status(500).json({ ok: false, error: "PROXY_API_KEY_NOT_CONFIGURED" });
+    return false;
+  }
+  if (!key || key !== PROXY_API_KEY) {
     res.status(401).json({ ok: false, error: "UNAUTHORIZED_PROXY_KEY" });
     return false;
   }
   return true;
 }
 
-async function readTextSafe(res) {
-  const t = await res.text();
-  return t;
+function pickForwardHeaders(req) {
+  // Forward minimal, safe headers
+  const h = new Headers();
+
+  // Authorization (Bearer) and content-type are useful for most API calls
+  if (req.headers.authorization) h.set("authorization", req.headers.authorization);
+  if (req.headers["content-type"]) h.set("content-type", req.headers["content-type"]);
+  if (req.headers.accept) h.set("accept", req.headers.accept);
+
+  // User-Agent: helpful for upstream logs (optional)
+  h.set("user-agent", req.headers["user-agent"] || "Credit2Credit/Proxy");
+
+  return h;
 }
 
-// -------------------------
-// CORS preflight
-// -------------------------
-app.options("*", (req, res) => {
-  setCors(req, res);
-  res.status(204).send("");
-});
+async function readUpstream(res) {
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // ignore
+  }
+  return { text, json };
+}
 
-// -------------------------
+// ---------- Routes ----------
+
 // Health
-// -------------------------
-app.get("/", (req, res) => {
-  setCors(req, res);
-  res.status(200).send("ok");
+app.get("/", (_req, res) => res.status(200).send("ok"));
+
+// CORS preflight
+app.options("*", (req, res) => {
+  sendCors(req, res);
+  return res.status(204).end();
 });
 
-// -------------------------
-// OAUTH TOKEN (ConsumerDirect)
-// Supports ALL the legacy paths so Base44 never 404s
-// -------------------------
-async function handleOauthToken(req, res) {
-  setCors(req, res);
+// 1) Token endpoint: POST /oauth/token  ->  AUTH_BASE + /oauth2/token
+app.post("/oauth/token", async (req, res) => {
+  sendCors(req, res);
   if (!requireProxyKey(req, res)) return;
 
-  if (!CLIENT_ID || !CLIENT_SECRET) {
-    return res.status(500).json({
-      ok: false,
-      error: "MISSING_CD_PAPI_CREDS",
-      missing: ["CD_PAPI_PROD_CLIENT_ID", "CD_PAPI_PROD_CLIENT_SECRET"].filter((k) => !process.env[k]),
-    });
-  }
-
   try {
-    const url = `${AUTH_BASE}/oauth2/token`;
+    if (!CLIENT_ID || !CLIENT_SECRET) {
+      return res.status(500).json({
+        ok: false,
+        error: "MISSING_CD_PAPI_PROD_CLIENT_ID_OR_SECRET",
+      });
+    }
 
-    // Most client_credentials token endpoints expect x-www-form-urlencoded
+    // Accept either JSON body or form body from caller
+    const grant_type = req.body?.grant_type || "client_credentials";
+    const scope = req.body?.scope ?? CD_SCOPE;
+
     const body = new URLSearchParams();
-    body.set("grant_type", "client_credentials");
-    if (CD_SCOPE) body.set("scope", CD_SCOPE);
+    body.set("grant_type", grant_type);
+    if (scope) body.set("scope", scope);
 
     const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
-    const cdRes = await fetch(url, {
+    const upstreamUrl = `${AUTH_BASE.replace(/\/+$/, "")}/oauth2/token`;
+
+    const upstreamRes = await fetch(upstreamUrl, {
       method: "POST",
       headers: {
-        "Authorization": `Basic ${basic}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
+        authorization: `Basic ${basic}`,
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "application/json",
       },
       body,
     });
 
-    const text = await readTextSafe(cdRes);
+    const { text, json } = await readUpstream(upstreamRes);
 
-    // Try parse JSON, but don’t crash if it isn’t
-    let json = null;
-    try {
-      json = JSON.parse(text);
-    } catch {}
-
-    if (!cdRes.ok) {
-      return res.status(cdRes.status).json({
-        ok: false,
-        upstream: "consumerdirect_auth",
-        status: cdRes.status,
-        data: json || { raw: text },
-      });
-    }
-
-    // Success
-    return res.status(200).json(json || { raw: text });
+    // Pass through status code + body
+    res.status(upstreamRes.status);
+    if (json) return res.json(json);
+    return res.send(text);
   } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: "OAUTH_PROXY_ERROR",
-      message: e?.message || String(e),
+      error: "TOKEN_PROXY_ERROR",
+      debug: String(e?.message || e),
     });
-  }
-}
-
-// NEW “correct” path you already used
-app.post("/auth/oauth2/token", handleOauthToken);
-
-// Alias paths that previously caused `Cannot POST ...`
-app.post("/oauth/token", handleOauthToken);
-app.post("/auth/oauth/token", handleOauthToken);
-app.post("/auth/oauth2/token", handleOauthToken); // extra safety
-
-// -------------------------
-// OPTIONAL: PAPI passthrough (so Base44 can call your proxy for PAPI too)
-// Example: GET/POST https://your-proxy.onrender.com/papi/v1/...
-// Requires caller to send Authorization: Bearer <papi_access_token>
-// -------------------------
-app.all("/papi/*", async (req, res) => {
-  setCors(req, res);
-  if (!requireProxyKey(req, res)) return;
-
-  try {
-    const path = req.originalUrl.replace(/^\/papi/, "");
-    const url = `${PAPI_BASE}${path}`;
-
-    // forward headers (keep Authorization for Bearer token)
-    const headers = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      const lk = k.toLowerCase();
-      if (["host", "content-length", "connection"].includes(lk)) continue;
-      if (lk === "x-proxy-api-key") continue;
-      headers[k] = v;
-    }
-
-    const method = req.method.toUpperCase();
-    const hasBody = !["GET", "HEAD"].includes(method);
-
-    const upstream = await fetch(url, {
-      method,
-      headers,
-      body: hasBody ? (req.body && Object.keys(req.body).length ? JSON.stringify(req.body) : req) : undefined,
-    });
-
-    res.status(upstream.status);
-
-    // Copy content-type
-    const ct = upstream.headers.get("content-type");
-    if (ct) res.setHeader("content-type", ct);
-
-    const out = await upstream.arrayBuffer();
-    res.send(Buffer.from(out));
-  } catch (e) {
-    res.status(500).json({ ok: false, error: "PAPI_PROXY_ERROR", message: e?.message || String(e) });
   }
 });
 
-// -------------------------
+// 2) PAPI forwarder: ANY /papi/*  ->  PAPI_BASE + (strip leading /papi)
+app.all("/papi/*", async (req, res) => {
+  sendCors(req, res);
+  if (!requireProxyKey(req, res)) return;
+
+  try {
+    // ✅ THIS IS THE FIX:
+    // incoming: /papi/v1/partners/me
+    // upstream:  /v1/partners/me
+    const upstreamPath = req.originalUrl.replace(/^\/papi/, "");
+    const upstreamUrl = `${PAPI_BASE.replace(/\/+$/, "")}${upstreamPath}`;
+
+    const headers = pickForwardHeaders(req);
+
+    // Determine body: for GET/HEAD no body
+    const method = req.method.toUpperCase();
+    let body = undefined;
+
+    if (!["GET", "HEAD"].includes(method)) {
+      if (req.is("application/json")) {
+        body = JSON.stringify(req.body ?? {});
+        if (!headers.get("content-type")) headers.set("content-type", "application/json");
+      } else if (req.is("application/x-www-form-urlencoded")) {
+        // If caller sent urlencoded, express already parsed it
+        const params = new URLSearchParams();
+        Object.entries(req.body || {}).forEach(([k, v]) => params.set(k, String(v)));
+        body = params.toString();
+        headers.set("content-type", "application/x-www-form-urlencoded");
+      } else {
+        // Fallback: if caller posted raw, express may not preserve it; prefer JSON or urlencoded
+        body = JSON.stringify(req.body ?? {});
+        headers.set("content-type", "application/json");
+      }
+    }
+
+    const upstreamRes = await fetch(upstreamUrl, { method, headers, body });
+    const { text, json } = await readUpstream(upstreamRes);
+
+    res.status(upstreamRes.status);
+    if (json) return res.json(json);
+    return res.send(text);
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: "PAPI_PROXY_ERROR",
+      debug: String(e?.message || e),
+    });
+  }
+});
+
+// Fallback for unknown routes
+app.use((req, res) => {
+  sendCors(req, res);
+  res.status(404).json({ ok: false, error: "NOT_FOUND", path: req.originalUrl });
+});
+
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`[proxy] listening on :${PORT}`);
 });
