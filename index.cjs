@@ -1,4 +1,4 @@
-// index.cjs
+// index.cjs (FULL REPLACE)
 const express = require("express");
 const { fetch, ProxyAgent, setGlobalDispatcher } = require("undici");
 
@@ -7,31 +7,26 @@ const PORT = process.env.PORT || 10000;
 
 app.use(express.json());
 
-// ----------------------
-// FORCE FIXIE EGRESS
-// ----------------------
-const PROXY_URL =
-  process.env.HTTPS_PROXY ||
-  process.env.HTTP_PROXY ||
-  process.env.FIXIE_URL ||
-  process.env.FIXIE;
-
-if (PROXY_URL) {
+// ------------------------------
+// Force ALL outbound HTTP(S) through Fixie (Undici)
+// ------------------------------
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.FIXIE_URL;
+if (proxyUrl) {
   try {
-    const agent = new ProxyAgent(PROXY_URL);
+    const agent = new ProxyAgent(proxyUrl);
     setGlobalDispatcher(agent);
-    console.log("[proxy] Using outbound proxy:", PROXY_URL.replace(/\/\/.*@/, "//****:****@"));
+    console.log("[proxy] Using upstream proxy:", proxyUrl.replace(/:\/\/.*@/, "://***@"));
   } catch (e) {
-    console.log("[proxy] Failed to set proxy agent:", e?.message || String(e));
+    console.log("[proxy] Failed to set ProxyAgent:", e?.message || String(e));
   }
 } else {
-  console.log("[proxy] No outbound proxy env found (HTTP_PROXY/HTTPS_PROXY/FIXIE_URL). Outbound calls will be DIRECT.");
+  console.log("[proxy] No HTTP_PROXY/HTTPS_PROXY/FIXIE_URL set; outbound will use Render IP.");
 }
 
-// ----------------------
-// AUTH GATES
-// ----------------------
-function requireProxyKey(req, res) {
+// ------------------------------
+// Auth guards
+// ------------------------------
+function requireProxyApiKey(req, res) {
   const key = req.headers["x-proxy-api-key"];
   if (!key || key !== process.env.PROXY_API_KEY) {
     res.status(401).json({ ok: false, error: "INVALID_PROXY_KEY" });
@@ -41,51 +36,61 @@ function requireProxyKey(req, res) {
 }
 
 function requireSharedSecret(req, res) {
-  const secret = req.headers["x-shared-secret"];
-  if (!secret || secret !== process.env.CD_PROXY_INTERNAL_SHARED_SECRET) {
-    res.status(401).json({ ok: false, error: "INVALID_SHARED_SECRET" });
+  const provided =
+    req.headers["x-shared-secret"] ||
+    req.headers["x-shared_secret"] ||
+    req.headers["x-sharedsecret"] ||
+    req.headers["x-shared-secret".toLowerCase()] ||
+    req.headers["x-shared-secret".toUpperCase()] ||
+    req.headers["x-shared-secret"]; // redundant but safe
+
+  const expected = process.env.CD_PROXY_INTERNAL_SHARED_SECRET;
+
+  if (!provided || !expected || provided !== expected) {
+    res.status(401).json({
+      ok: false,
+      error: "INVALID_SHARED_SECRET",
+      hasProvided: !!provided,
+      hasExpected: !!expected,
+    });
     return false;
   }
   return true;
 }
 
-function buildBasicAuth(id, secret) {
-  return "Basic " + Buffer.from(`${id}:${secret}`).toString("base64");
-}
+// ------------------------------
+// Health + egress IP (for whitelist verification)
+// ------------------------------
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ----------------------
-// HEALTH + EGRESS CHECK
-// ----------------------
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    hasProxyEnv: !!PROXY_URL,
-  });
-});
-
-// This proves what IP ConsumerDirect will see
 app.get("/egress-ip", async (req, res) => {
   try {
+    // This request will go through Fixie if ProxyAgent is set correctly
     const r = await fetch("https://api.ipify.org?format=json", {
       method: "GET",
       headers: { accept: "application/json" },
     });
     const text = await r.text();
-    res.status(r.status).set("content-type", "application/json").send(text);
+    res.status(200).type("application/json").send(text);
   } catch (e) {
     res.status(500).json({ ok: false, error: "EGRESS_IP_FAILED", message: e?.message || String(e) });
   }
 });
 
-// ----------------------
-// OAUTH TOKEN (through proxy, protected by PROXY_API_KEY)
-// ----------------------
+// ------------------------------
+// OAuth token (PAPI JWT) - keep behind x-proxy-api-key
+// ------------------------------
+function buildBasicAuth(id, secret) {
+  return "Basic " + Buffer.from(`${id}:${secret}`).toString("base64");
+}
+
 app.post("/oauth/token", async (req, res) => {
   try {
-    if (!requireProxyKey(req, res)) return;
+    if (!requireProxyApiKey(req, res)) return;
 
     const clientId = process.env.CD_PAPI_PROD_CLIENT_ID;
     const clientSecret = process.env.CD_PAPI_PROD_CLIENT_SECRET;
+    const scope = process.env.CD_PAPI_SCOPE; // optional but recommended
 
     if (!clientId || !clientSecret) {
       return res.status(500).json({
@@ -93,11 +98,15 @@ app.post("/oauth/token", async (req, res) => {
         error: "MISSING_OAUTH_CREDS",
         hasClientId: !!clientId,
         hasClientSecret: !!clientSecret,
+        hasScope: !!scope,
       });
     }
 
     const authHeader = req.headers["authorization"] || buildBasicAuth(clientId, clientSecret);
-    const body = new URLSearchParams({ grant_type: "client_credentials" }).toString();
+
+    const params = new URLSearchParams();
+    params.set("grant_type", "client_credentials");
+    if (scope) params.set("scope", scope);
 
     const upstream = await fetch("https://auth.consumerdirect.io/oauth2/token", {
       method: "POST",
@@ -106,24 +115,24 @@ app.post("/oauth/token", async (req, res) => {
         accept: "application/json",
         authorization: authHeader,
       },
-      body,
+      body: params.toString(),
     });
 
     const text = await upstream.text();
     res.status(upstream.status);
-    res.set("content-type", upstream.headers.get("content-type") || "application/json");
+    res.set("content-type", "application/json");
     return res.send(text);
   } catch (e) {
     return res.status(500).json({ ok: false, step: "oauth_exception", message: e?.message || String(e) });
   }
 });
 
-// ----------------------
-// /papi passthrough (protected by PROXY_API_KEY)
-// ----------------------
+// ------------------------------
+// PAPI passthrough (x-proxy-api-key) -> https://papi.consumerdirect.io/*
+// ------------------------------
 app.use("/papi", async (req, res) => {
   try {
-    if (!requireProxyKey(req, res)) return;
+    if (!requireProxyApiKey(req, res)) return;
 
     const upstreamPath = req.originalUrl.replace(/^\/papi/, "");
     const upstreamUrl = `https://papi.consumerdirect.io${upstreamPath}`;
@@ -149,10 +158,10 @@ app.use("/papi", async (req, res) => {
   }
 });
 
-// ----------------------
-// /cd passthrough (protected by X-Shared-Secret)
-// This matches the last-known-working OTC pattern.
-// ----------------------
+// ------------------------------
+// CD passthrough (X-Shared-Secret) -> https://papi.consumerdirect.io/*
+// This matches your LAST-KNOWN-WORKING call: /cd/v1/customers/{token}/otcs/login-as
+// ------------------------------
 app.use("/cd", async (req, res) => {
   try {
     if (!requireSharedSecret(req, res)) return;
@@ -163,7 +172,7 @@ app.use("/cd", async (req, res) => {
     const headers = {
       accept: req.headers["accept"] || "application/json",
       "content-type": req.headers["content-type"] || "application/json",
-      authorization: req.headers["authorization"], // OPTIONAL if you pass it
+      authorization: req.headers["authorization"], // Bearer <papiAccessToken>
     };
     Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
 
@@ -178,6 +187,39 @@ app.use("/cd", async (req, res) => {
     return res.send(text);
   } catch (e) {
     return res.status(500).json({ ok: false, step: "cd_exception", message: e?.message || String(e) });
+  }
+});
+
+// ------------------------------
+// SmartCredit passthrough (x-proxy-api-key) -> https://api.smartcredit.com/*
+// ------------------------------
+app.use("/sc", async (req, res) => {
+  try {
+    if (!requireProxyApiKey(req, res)) return;
+
+    const upstreamPath = req.originalUrl.replace(/^\/sc/, "");
+    const upstreamUrl = `https://api.smartcredit.com${upstreamPath}`;
+
+    const headers = {
+      accept: req.headers["accept"] || "application/json",
+      "content-type": req.headers["content-type"],
+      authorization: req.headers["authorization"],
+      "x-customer-token": req.headers["x-customer-token"],
+      "x-customertoken": req.headers["x-customertoken"],
+    };
+    Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
+
+    let body;
+    if (!["GET", "HEAD"].includes(req.method)) body = JSON.stringify(req.body ?? {});
+
+    const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
+    const text = await upstream.text();
+
+    res.status(upstream.status);
+    res.set("content-type", upstream.headers.get("content-type") || "application/json");
+    return res.send(text);
+  } catch (e) {
+    return res.status(500).json({ ok: false, step: "sc_exception", message: e?.message || String(e) });
   }
 });
 
