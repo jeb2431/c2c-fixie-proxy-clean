@@ -1,7 +1,10 @@
 {
   "name": "c2c-fixie-proxy-clean",
-  "type": "module",
-  "main": "index.js",
+  "version": "1.0.0",
+  "main": "index.cjs",
+  "scripts": {
+    "start": "node index.cjs"
+  },
   "dependencies": {
     "express": "^4.19.2",
     "undici": "^6.19.8"
