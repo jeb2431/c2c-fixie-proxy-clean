@@ -1,12 +1,12 @@
-import express from "express";
-import { ProxyAgent, setGlobalDispatcher } from "undici";
+const express = require("express");
+const { ProxyAgent, setGlobalDispatcher } = require("undici");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.use(express.json());
 
-// ---------------- FIXIE SETUP (CRITICAL) ----------------
+// ---- FORCE OUTBOUND TRAFFIC THROUGH FIXIE ----
 const FIXIE_URL = process.env.FIXIE_URL;
 
 if (FIXIE_URL) {
@@ -21,7 +21,7 @@ if (FIXIE_URL) {
   console.log("[proxy] FIXIE_URL NOT SET — OTC WILL FAIL");
 }
 
-// ---------------- AUTH ----------------
+// ---- AUTH ----
 function requireProxyKey(req, res) {
   const key = req.headers["x-proxy-api-key"];
   if (!key || key !== process.env.PROXY_API_KEY) {
@@ -35,7 +35,7 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, fixie: !!process.env.FIXIE_URL })
 );
 
-// ---------------- PAPI PASSTHROUGH ----------------
+// ---- PAPI passthrough ----
 app.use("/papi", async (req, res) => {
   try {
     if (!requireProxyKey(req, res)) return;
@@ -48,38 +48,24 @@ app.use("/papi", async (req, res) => {
       "content-type": req.headers["content-type"],
       authorization: req.headers["authorization"],
     };
-    Object.keys(headers).forEach(
-      (k) => headers[k] === undefined && delete headers[k]
-    );
+    Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
 
     let body;
-    if (!["GET", "HEAD"].includes(req.method)) {
-      body = JSON.stringify(req.body ?? {});
-    }
+    if (!["GET", "HEAD"].includes(req.method)) body = JSON.stringify(req.body ?? {});
 
-    const upstream = await fetch(upstreamUrl, {
-      method: req.method,
-      headers,
-      body,
-    });
-
+    const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
     const text = await upstream.text();
 
     res.status(upstream.status);
-    res.set(
-      "content-type",
-      upstream.headers.get("content-type") || "application/json"
-    );
+    res.set("content-type", upstream.headers.get("content-type") || "application/json");
     return res.send(text);
   } catch (e) {
     console.error("papi_exception", e);
-    return res
-      .status(500)
-      .json({ ok: false, step: "papi_exception", message: String(e) });
+    return res.status(500).json({ ok: false, step: "papi_exception", message: e?.message || String(e) });
   }
 });
 
-// ---------------- SMARTCREDIT PASSTHROUGH ----------------
+// ---- SmartCredit passthrough ----
 app.use("/sc", async (req, res) => {
   try {
     if (!requireProxyKey(req, res)) return;
@@ -94,37 +80,21 @@ app.use("/sc", async (req, res) => {
       "x-customer-token": req.headers["x-customer-token"],
       "x-customertoken": req.headers["x-customertoken"],
     };
-    Object.keys(headers).forEach(
-      (k) => headers[k] === undefined && delete headers[k]
-    );
+    Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
 
     let body;
-    if (!["GET", "HEAD"].includes(req.method)) {
-      body = JSON.stringify(req.body ?? {});
-    }
+    if (!["GET", "HEAD"].includes(req.method)) body = JSON.stringify(req.body ?? {});
 
-    const upstream = await fetch(upstreamUrl, {
-      method: req.method,
-      headers,
-      body,
-    });
-
+    const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
     const text = await upstream.text();
 
     res.status(upstream.status);
-    res.set(
-      "content-type",
-      upstream.headers.get("content-type") || "application/json"
-    );
+    res.set("content-type", upstream.headers.get("content-type") || "application/json");
     return res.send(text);
   } catch (e) {
     console.error("sc_exception", e);
-    return res
-      .status(500)
-      .json({ ok: false, step: "sc_exception", message: String(e) });
+    return res.status(500).json({ ok: false, step: "sc_exception", message: e?.message || String(e) });
   }
 });
 
-app.listen(PORT, () =>
-  console.log(`proxy listening on ${PORT}`)
-);
+app.listen(PORT, () => console.log(`proxy listening on ${PORT}`));
