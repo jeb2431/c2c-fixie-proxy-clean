@@ -1,3 +1,5 @@
+// index.cjs (FULL REPLACE)
+
 const express = require("express");
 const { ProxyAgent, setGlobalDispatcher } = require("undici");
 
@@ -21,6 +23,7 @@ if (FIXIE_URL) {
   console.log("[proxy] FIXIE_URL NOT SET — OTC WILL FAIL");
 }
 
+// ---- AUTH ----
 function requireProxyKey(req, res) {
   const key = req.headers["x-proxy-api-key"];
   if (!key || key !== process.env.PROXY_API_KEY) {
@@ -34,7 +37,7 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, fixie: !!process.env.FIXIE_URL })
 );
 
-// ✅ NEW: show the REAL outbound public IP (this is what ConsumerDirect sees)
+// ✅ egress IP check (what ConsumerDirect sees)
 app.get("/egress-ip", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json", { method: "GET" });
@@ -45,7 +48,7 @@ app.get("/egress-ip", async (req, res) => {
   }
 });
 
-// PAPI passthrough
+// ---- PAPI passthrough (OTC MUST go through this) ----
 app.use("/papi", async (req, res) => {
   try {
     if (!requireProxyKey(req, res)) return;
@@ -66,7 +69,17 @@ app.use("/papi", async (req, res) => {
     const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
     const text = await upstream.text();
 
+    // Return upstream status
     res.status(upstream.status);
+
+    // ✅ Debug headers to expose Cloudflare / upstream details
+    res.set("x-upstream-status", String(upstream.status));
+    res.set("x-upstream-server", upstream.headers.get("server") || "");
+    res.set("x-upstream-cf-ray", upstream.headers.get("cf-ray") || "");
+    res.set("x-upstream-cf-cache-status", upstream.headers.get("cf-cache-status") || "");
+    res.set("x-upstream-content-type", upstream.headers.get("content-type") || "");
+
+    // Keep upstream content-type if present
     res.set("content-type", upstream.headers.get("content-type") || "application/json");
     return res.send(text);
   } catch (e) {
@@ -75,7 +88,7 @@ app.use("/papi", async (req, res) => {
   }
 });
 
-// SmartCredit passthrough
+// ---- SmartCredit passthrough (NOT for OTC) ----
 app.use("/sc", async (req, res) => {
   try {
     if (!requireProxyKey(req, res)) return;
@@ -86,7 +99,7 @@ app.use("/sc", async (req, res) => {
     const headers = {
       accept: req.headers["accept"] || "application/json",
       "content-type": req.headers["content-type"],
-      authorization: req.headers["authorization"],
+      authorization: req.headers["authorization"], // Bearer token
       "x-customer-token": req.headers["x-customer-token"],
       "x-customertoken": req.headers["x-customertoken"],
     };
