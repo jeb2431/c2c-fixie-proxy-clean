@@ -21,7 +21,6 @@ if (FIXIE_URL) {
   console.log("[proxy] FIXIE_URL NOT SET — OTC WILL FAIL");
 }
 
-// ---- AUTH ----
 function requireProxyKey(req, res) {
   const key = req.headers["x-proxy-api-key"];
   if (!key || key !== process.env.PROXY_API_KEY) {
@@ -35,7 +34,18 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, fixie: !!process.env.FIXIE_URL })
 );
 
-// ---- PAPI passthrough ----
+// ✅ NEW: show the REAL outbound public IP (this is what ConsumerDirect sees)
+app.get("/egress-ip", async (req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json", { method: "GET" });
+    const j = await r.json();
+    return res.json({ ok: true, fixie: !!process.env.FIXIE_URL, ip: j?.ip || null });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "EGRESS_IP_FAILED", message: String(e) });
+  }
+});
+
+// PAPI passthrough
 app.use("/papi", async (req, res) => {
   try {
     if (!requireProxyKey(req, res)) return;
@@ -65,7 +75,7 @@ app.use("/papi", async (req, res) => {
   }
 });
 
-// ---- SmartCredit passthrough ----
+// SmartCredit passthrough
 app.use("/sc", async (req, res) => {
   try {
     if (!requireProxyKey(req, res)) return;
