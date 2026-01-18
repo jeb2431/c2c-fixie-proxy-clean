@@ -37,7 +37,6 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, fixie: !!process.env.FIXIE_URL })
 );
 
-// OPTIONAL: verify egress IP (you already used this)
 app.get("/egress-ip", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json", { method: "GET" });
@@ -49,15 +48,13 @@ app.get("/egress-ip", async (req, res) => {
 });
 
 /**
- * ✅ WORKING ROUTE FAMILY (the one that previously produced OTC codes):
  * Base44 -> proxy:
  *   POST /cd/v1/customers/{customerToken}/otcs/login-as
  *   Header: X-Shared-Secret: <CD_PROXY_INTERNAL_SHARED_SECRET>
+ *   Header: Authorization: Bearer <PAPI_ACCESS_TOKEN>   <-- NOW PASSED THROUGH
  *
  * Proxy -> upstream:
  *   https://papi.consumerdirect.io/v1/customers/{customerToken}/otcs/login-as
- *
- * Note: We REMOVE the "/cd" prefix when forwarding upstream.
  */
 app.use("/cd", async (req, res) => {
   try {
@@ -68,16 +65,19 @@ app.use("/cd", async (req, res) => {
 
     const headers = {
       accept: req.headers["accept"] || "application/json",
-      "content-type": req.headers["content-type"],
-      // IMPORTANT: No Bearer token needed for this specific working flow
-      // We are only forwarding whitelisted-IP traffic with shared-secret gate.
+      "content-type": req.headers["content-type"] || "application/json",
+      // ✅ pass through Bearer token if Base44 provided it
+      authorization: req.headers["authorization"],
     };
     Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
 
     let body;
     if (!["GET", "HEAD"].includes(req.method)) {
-      // In the working flow, OTC had no body. But we safely pass if present.
-      body = JSON.stringify(req.body ?? {});
+      // If Base44 sends no body, req.body will be {} (express.json). We'll only send a body when Base44 intended one.
+      // Detect "no body intended" by checking content-length header.
+      const clen = req.headers["content-length"];
+      const hasBody = clen && String(clen) !== "0";
+      if (hasBody) body = JSON.stringify(req.body ?? {});
     }
 
     const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
