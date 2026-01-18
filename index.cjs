@@ -1,180 +1,116 @@
-import { createClientFromRequest } from "npm:@base44/sdk@0.8.6";
+const express = require("express");
 
-async function readJsonSafe(res) {
-  const text = await res.text();
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.use(express.json());
+
+function unauthorized(res, reason) {
+  return res.status(401).json({ ok: false, error: reason || "UNAUTHORIZED" });
+}
+
+// Accept either header style:
+// - X-Shared-Secret (old working flow)
+// - x-proxy-api-key (newer flow)
+function requireProxyAuth(req, res) {
+  const shared = req.headers["x-shared-secret"];
+  const key = req.headers["x-proxy-api-key"];
+
+  const expectedShared = process.env.CD_PROXY_INTERNAL_SHARED_SECRET;
+  const expectedKey = process.env.PROXY_API_KEY;
+
+  if (expectedShared && shared && shared === expectedShared) return true;
+  if (expectedKey && key && key === expectedKey) return true;
+
+  if (shared) return unauthorized(res, "INVALID_SHARED_SECRET");
+  if (key) return unauthorized(res, "INVALID_PROXY_KEY");
+  return unauthorized(res, "MISSING_PROXY_AUTH");
+}
+
+app.get("/health", (req, res) => res.json({ ok: true, service: "c2c-fixie-proxy-clean" }));
+
+// Simple endpoint to verify the outbound IP of THIS service (through Fixie)
+app.get("/egress-ip", async (req, res) => {
   try {
-    return { text, json: JSON.parse(text) };
-  } catch {
-    return { text, json: null };
+    // uses Node18+ global fetch
+    const r = await fetch("https://api.ipify.org?format=json", { method: "GET" });
+    const j = await r.json();
+    return res.json({ ok: true, fixie: true, ip: j.ip });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "EGRESS_IP_FAILED", message: e?.message || String(e) });
   }
-}
-
-function preview(val) {
-  if (!val || typeof val !== "string") return null;
-  if (val.length <= 12) return `${val.slice(0, 4)}…${val.slice(-3)}`;
-  return `${val.slice(0, 6)}…************…${val.slice(-6)}`;
-}
-
-async function mintPapiAccessToken() {
-  const oauthUrl =
-    (Deno.env.get("CD_PAPI_OAUTH_URL") || "https://auth.consumerdirect.io/oauth2/token").trim();
-  const clientId = (Deno.env.get("CD_PAPI_CLIENT_ID") || "").trim();
-  const clientSecret = (Deno.env.get("CD_PAPI_CLIENT_SECRET") || "").trim();
-  const scope = (Deno.env.get("CD_PAPI_SCOPE") || "").trim();
-
-  if (!clientId || !clientSecret) {
-    return {
-      ok: false,
-      error: "MISSING_PAPI_CREDENTIALS",
-      requiredSecrets: ["CD_PAPI_CLIENT_ID", "CD_PAPI_CLIENT_SECRET", "CD_PAPI_OAUTH_URL", "CD_PAPI_SCOPE"],
-    };
-  }
-
-  const params = new URLSearchParams();
-  params.set("grant_type", "client_credentials");
-  if (scope) params.set("scope", scope);
-
-  const basicAuth = btoa(`${clientId}:${clientSecret}`);
-
-  const res = await fetch(oauthUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Basic ${basicAuth}`,
-      "content-type": "application/x-www-form-urlencoded",
-      accept: "application/json",
-    },
-    body: params.toString(),
-  });
-
-  const { text, json } = await readJsonSafe(res);
-  if (!res.ok) return { ok: false, error: "PAPI_OAUTH_FAILED", status: res.status, raw: text, parsed: json };
-
-  const token = json?.access_token || null;
-  if (!token) return { ok: false, error: "NO_ACCESS_TOKEN", raw: text, parsed: json };
-
-  return { ok: true, papiAccessToken: token, expiresIn: json?.expires_in ?? null, scope: json?.scope ?? scope ?? null };
-}
-
-Deno.serve(async (req) => {
-  createClientFromRequest(req);
-
-  let body = {};
-  try {
-    body = await req.json();
-  } catch {
-    body = {};
-  }
-
-  const customerToken = (body?.customerToken || "").trim();
-  const agentId = (body?.agentId || "joelb").trim();
-
-  if (!customerToken) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        step: "C",
-        error: "MISSING_CUSTOMER_TOKEN",
-        requiredBody: { customerToken: "3fcc39ca-0678-4f8a-8f09-3b895eaf0e26", agentId: "joelb" },
-      }),
-      { status: 400, headers: { "content-type": "application/json" } }
-    );
-  }
-
-  const proxyUrl = (Deno.env.get("CD_PROXY_URL") || "").trim();
-  const sharedSecret = (Deno.env.get("CD_PROXY_INTERNAL_SHARED_SECRET") || "").trim();
-
-  if (!proxyUrl || !sharedSecret) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        step: "C",
-        error: "MISSING_PROXY_SECRETS",
-        requiredSecrets: ["CD_PROXY_URL", "CD_PROXY_INTERNAL_SHARED_SECRET"],
-        hasProxyUrl: !!proxyUrl,
-        hasSharedSecret: !!sharedSecret,
-      }),
-      { status: 500, headers: { "content-type": "application/json" } }
-    );
-  }
-
-  const tok = await mintPapiAccessToken();
-  if (!tok.ok) {
-    return new Response(
-      JSON.stringify({ ok: false, step: "C", where: "mintPapiAccessToken", ...tok }),
-      { status: 502, headers: { "content-type": "application/json" } }
-    );
-  }
-
-  const papiAccessToken = tok.papiAccessToken;
-
-  // ✅ matches the doc: /v1/customers/{customerToken}/otcs/login-as
-  // ✅ via your proxy route: /cd + same path
-  const url =
-    proxyUrl.replace(/\/+$/, "") +
-    "/cd/v1/customers/" +
-    encodeURIComponent(customerToken) +
-    "/otcs/login-as";
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "X-Shared-Secret": sharedSecret,
-      Authorization: `Bearer ${papiAccessToken}`,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ agentId }),
-  });
-
-  const { text, json } = await readJsonSafe(res);
-
-  if (!res.ok) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        step: "C",
-        error: "OTC_REQUEST_FAILED",
-        status: res.status,
-        url,
-        papiAccessToken_preview: preview(papiAccessToken),
-        scope: tok.scope ?? null,
-        raw: text?.slice(0, 2000),
-        parsed: json,
-      }),
-      { status: 502, headers: { "content-type": "application/json" } }
-    );
-  }
-
-  const otcCode = json?.code || null;
-
-  if (!otcCode) {
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        step: "C",
-        error: "NO_OTC_CODE_IN_RESPONSE",
-        status: res.status,
-        url,
-        raw: text?.slice(0, 2000),
-        parsed: json,
-      }),
-      { status: 502, headers: { "content-type": "application/json" } }
-    );
-  }
-
-  return new Response(
-    JSON.stringify({
-      ok: true,
-      step: "C",
-      url,
-      customerToken_preview: preview(customerToken),
-      agentId,
-      otcCode,
-      otcCode_preview: preview(otcCode),
-      expirationDateTime: json?.expirationDateTime ?? null,
-      type: json?.type ?? null,
-      note: "NEXT: Step D exchange otcCode for SmartCredit customer JWT (GET, no proxy).",
-    }),
-    { status: 200, headers: { "content-type": "application/json" } }
-  );
 });
+
+// OAuth token mint (optional helper)
+app.post("/oauth/token", async (req, res) => {
+  try {
+    if (!requireProxyAuth(req, res)) return;
+
+    const clientId = process.env.CD_PAPI_PROD_CLIENT_ID;
+    const clientSecret = process.env.CD_PAPI_PROD_CLIENT_SECRET;
+    const scope = process.env.CD_PAPI_SCOPE; // e.g. target-entity:...
+
+    if (!clientId || !clientSecret) {
+      return res.status(500).json({
+        ok: false,
+        error: "MISSING_OAUTH_CREDS",
+        hasClientId: !!clientId,
+        hasClientSecret: !!clientSecret
+      });
+    }
+
+    const authHeader = "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+
+    const params = new URLSearchParams();
+    params.set("grant_type", "client_credentials");
+    if (scope) params.set("scope", scope);
+
+    const upstream = await fetch("https://auth.consumerdirect.io/oauth2/token", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "application/json",
+        authorization: authHeader
+      },
+      body: params.toString()
+    });
+
+    const text = await upstream.text();
+    res.status(upstream.status);
+    res.set("content-type", upstream.headers.get("content-type") || "application/json");
+    return res.send(text);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "OAUTH_EXCEPTION", message: e?.message || String(e) });
+  }
+});
+
+// /cd/* passthrough to PAPI (this matches the old working function path you quoted)
+app.use("/cd", async (req, res) => {
+  try {
+    if (!requireProxyAuth(req, res)) return;
+
+    const upstreamPath = req.originalUrl.replace(/^\/cd/, "");
+    const upstreamUrl = `https://papi.consumerdirect.io${upstreamPath}`;
+
+    const headers = {
+      accept: req.headers["accept"] || "application/json",
+      "content-type": req.headers["content-type"],
+      authorization: req.headers["authorization"]
+    };
+    Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
+
+    let body;
+    if (!["GET", "HEAD"].includes(req.method)) body = JSON.stringify(req.body ?? {});
+
+    const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
+    const text = await upstream.text();
+
+    res.status(upstream.status);
+    res.set("content-type", upstream.headers.get("content-type") || "application/json");
+    return res.send(text);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "CD_PROXY_EXCEPTION", message: e?.message || String(e) });
+  }
+});
+
+app.listen(PORT, () => console.log(`proxy listening on ${PORT}`));
