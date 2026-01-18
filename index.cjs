@@ -1,5 +1,25 @@
-const express = require("express");
-const fetch = global.fetch || require("node-fetch");
+import express from "express";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
+
+// ---- FORCE OUTBOUND TRAFFIC THROUGH FIXIE ----
+const FIXIE_URL = process.env.FIXIE_URL;
+
+// This is the critical missing piece.
+// Without this, your proxy does NOT originate from whitelisted IPs.
+if (FIXIE_URL) {
+  const agent = new ProxyAgent(FIXIE_URL);
+
+  // Make undici/global fetch use the proxy for ALL requests
+  setGlobalDispatcher(agent);
+
+  // Also set conventional env vars (harmless, but helps some libs)
+  process.env.HTTP_PROXY = FIXIE_URL;
+  process.env.HTTPS_PROXY = FIXIE_URL;
+
+  console.log("[proxy] FIXIE enabled:", FIXIE_URL.slice(0, 20) + "…");
+} else {
+  console.log("[proxy] FIXIE_URL is NOT set. OTC will likely 403.");
+}
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -19,9 +39,9 @@ function buildBasicAuth(id, secret) {
   return "Basic " + Buffer.from(`${id}:${secret}`).toString("base64");
 }
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true, fixie: !!process.env.FIXIE_URL }));
 
-// OAuth token (OTC)
+// OAuth token (OTC) - you can keep this, but Base44 Step A is already doing OAuth directly.
 app.post("/oauth/token", async (req, res) => {
   try {
     if (!requireProxyKey(req, res)) return;
@@ -103,7 +123,6 @@ app.use("/sc", async (req, res) => {
       accept: req.headers["accept"] || "application/json",
       "content-type": req.headers["content-type"],
       authorization: req.headers["authorization"], // Bearer token
-      // pass through any customer-context headers we try from Base44
       "x-customer-token": req.headers["x-customer-token"],
       "x-customertoken": req.headers["x-customertoken"],
     };
