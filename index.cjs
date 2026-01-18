@@ -23,11 +23,11 @@ if (FIXIE_URL) {
   console.log("[proxy] FIXIE_URL NOT SET — OTC WILL FAIL");
 }
 
-// ---- AUTH ----
-function requireProxyKey(req, res) {
-  const key = req.headers["x-proxy-api-key"];
-  if (!key || key !== process.env.PROXY_API_KEY) {
-    res.status(401).json({ ok: false, error: "INVALID_PROXY_KEY" });
+// ---- Shared Secret Auth (Base44 internal -> proxy) ----
+function requireSharedSecret(req, res) {
+  const key = req.headers["x-shared-secret"];
+  if (!key || key !== process.env.CD_PROXY_INTERNAL_SHARED_SECRET) {
+    res.status(401).json({ ok: false, error: "INVALID_SHARED_SECRET" });
     return false;
   }
   return true;
@@ -37,7 +37,7 @@ app.get("/health", (req, res) =>
   res.json({ ok: true, fixie: !!process.env.FIXIE_URL })
 );
 
-// ✅ egress IP check (what ConsumerDirect sees)
+// OPTIONAL: verify egress IP (you already used this)
 app.get("/egress-ip", async (req, res) => {
   try {
     const r = await fetch("https://api.ipify.org?format=json", { method: "GET" });
@@ -48,65 +48,37 @@ app.get("/egress-ip", async (req, res) => {
   }
 });
 
-// ---- PAPI passthrough (OTC MUST go through this) ----
-app.use("/papi", async (req, res) => {
+/**
+ * ✅ WORKING ROUTE FAMILY (the one that previously produced OTC codes):
+ * Base44 -> proxy:
+ *   POST /cd/v1/customers/{customerToken}/otcs/login-as
+ *   Header: X-Shared-Secret: <CD_PROXY_INTERNAL_SHARED_SECRET>
+ *
+ * Proxy -> upstream:
+ *   https://papi.consumerdirect.io/v1/customers/{customerToken}/otcs/login-as
+ *
+ * Note: We REMOVE the "/cd" prefix when forwarding upstream.
+ */
+app.use("/cd", async (req, res) => {
   try {
-    if (!requireProxyKey(req, res)) return;
+    if (!requireSharedSecret(req, res)) return;
 
-    const upstreamPath = req.originalUrl.replace(/^\/papi/, "");
+    const upstreamPath = req.originalUrl.replace(/^\/cd/, "");
     const upstreamUrl = `https://papi.consumerdirect.io${upstreamPath}`;
 
     const headers = {
       accept: req.headers["accept"] || "application/json",
       "content-type": req.headers["content-type"],
-      authorization: req.headers["authorization"],
+      // IMPORTANT: No Bearer token needed for this specific working flow
+      // We are only forwarding whitelisted-IP traffic with shared-secret gate.
     };
     Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
 
     let body;
-    if (!["GET", "HEAD"].includes(req.method)) body = JSON.stringify(req.body ?? {});
-
-    const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
-    const text = await upstream.text();
-
-    // Return upstream status
-    res.status(upstream.status);
-
-    // ✅ Debug headers to expose Cloudflare / upstream details
-    res.set("x-upstream-status", String(upstream.status));
-    res.set("x-upstream-server", upstream.headers.get("server") || "");
-    res.set("x-upstream-cf-ray", upstream.headers.get("cf-ray") || "");
-    res.set("x-upstream-cf-cache-status", upstream.headers.get("cf-cache-status") || "");
-    res.set("x-upstream-content-type", upstream.headers.get("content-type") || "");
-
-    // Keep upstream content-type if present
-    res.set("content-type", upstream.headers.get("content-type") || "application/json");
-    return res.send(text);
-  } catch (e) {
-    console.error("papi_exception", e);
-    return res.status(500).json({ ok: false, step: "papi_exception", message: e?.message || String(e) });
-  }
-});
-
-// ---- SmartCredit passthrough (NOT for OTC) ----
-app.use("/sc", async (req, res) => {
-  try {
-    if (!requireProxyKey(req, res)) return;
-
-    const upstreamPath = req.originalUrl.replace(/^\/sc/, "");
-    const upstreamUrl = `https://api.smartcredit.com${upstreamPath}`;
-
-    const headers = {
-      accept: req.headers["accept"] || "application/json",
-      "content-type": req.headers["content-type"],
-      authorization: req.headers["authorization"], // Bearer token
-      "x-customer-token": req.headers["x-customer-token"],
-      "x-customertoken": req.headers["x-customertoken"],
-    };
-    Object.keys(headers).forEach((k) => headers[k] === undefined && delete headers[k]);
-
-    let body;
-    if (!["GET", "HEAD"].includes(req.method)) body = JSON.stringify(req.body ?? {});
+    if (!["GET", "HEAD"].includes(req.method)) {
+      // In the working flow, OTC had no body. But we safely pass if present.
+      body = JSON.stringify(req.body ?? {});
+    }
 
     const upstream = await fetch(upstreamUrl, { method: req.method, headers, body });
     const text = await upstream.text();
@@ -115,8 +87,8 @@ app.use("/sc", async (req, res) => {
     res.set("content-type", upstream.headers.get("content-type") || "application/json");
     return res.send(text);
   } catch (e) {
-    console.error("sc_exception", e);
-    return res.status(500).json({ ok: false, step: "sc_exception", message: e?.message || String(e) });
+    console.error("cd_exception", e);
+    return res.status(500).json({ ok: false, step: "cd_exception", message: e?.message || String(e) });
   }
 });
 
