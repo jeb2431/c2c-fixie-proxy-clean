@@ -1,27 +1,10 @@
-// index.cjs
-// Copy/paste this ENTIRE file into your Render proxy repo as: index.cjs
-// Commit to GitHub, then redeploy on Render.
-//
-// IMPORTANT:
-// - This version fixes your 401 issue by accepting CD_PROXY_INTERNAL_SHARED_SECRET (your current Render env name)
-// - It also proves Fixie is being used by exposing PUBLIC /cd/ip (no key required)
-// - All /cd/* and /smartcredit/* routes stay PROTECTED by the proxy key
-//
-// REQUIRED ENV VARS ON RENDER (one of these must exist):
-// - CD_PROXY_INTERNAL_SHARED_SECRET   (recommended — matches your Base44 secret name)
-//   OR PROXY_API_KEY
-//
-// REQUIRED FOR WHITELISTED IP (Fixie):
-// - FIXIE_URL  OR  HTTPS_PROXY / HTTP_PROXY  (you already set these)
-//
-// OPTIONAL BASE URLS:
-// - CONSUMERDIRECT_BASE_URL = https://papi.consumerdirect.io
-// - CD_SMARTCREDIT_BASE_URL = https://api.smartcredit.com
+// index.js (ESM)
+// Copy/paste this ENTIRE file into your Render repo as index.js, commit, redeploy.
 
-const express = require("express");
-const axios = require("axios");
-const { HttpsProxyAgent } = require("https-proxy-agent");
-const { HttpProxyAgent } = require("http-proxy-agent");
+import express from "express";
+import axios from "axios";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { HttpProxyAgent } from "http-proxy-agent";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -33,29 +16,25 @@ const CONSUMERDIRECT_BASE_URL =
 const CD_SMARTCREDIT_BASE_URL =
   process.env.CD_SMARTCREDIT_BASE_URL || "https://api.smartcredit.com";
 
-// --- Proxy key (Render) ---
+// Proxy key (Render)
 const PROXY_KEY =
   process.env.CD_PROXY_INTERNAL_SHARED_SECRET ||
   process.env.PROXY_API_KEY ||
   "";
 
-// --- Fixie / proxy env (Render) ---
+// Fixie / proxy env (Render)
 const FIXIE_URL =
   process.env.HTTPS_PROXY ||
   process.env.HTTP_PROXY ||
   process.env.FIXIE_URL ||
   "";
 
-// Build proxy agents for axios (this is what ensures Fixie is used)
+// Force Fixie usage via agents
 const httpsAgent = FIXIE_URL ? new HttpsProxyAgent(FIXIE_URL) : undefined;
 const httpAgent = FIXIE_URL ? new HttpProxyAgent(FIXIE_URL) : undefined;
 
-// =======================
-// Helpers
-// =======================
 function requireProxyKey(req) {
-  // If no key configured, allow (not recommended, but useful during setup)
-  if (!PROXY_KEY) return;
+  if (!PROXY_KEY) return null; // allow if not set (not recommended)
 
   const provided =
     req.header("x-cd-proxy-secret") ||
@@ -71,18 +50,11 @@ function requireProxyKey(req) {
         "Send header x-cd-proxy-secret with the SAME value as Render env CD_PROXY_INTERNAL_SHARED_SECRET",
     };
   }
-
   return null;
 }
 
 function pickBearer(req) {
-  // We ONLY forward Authorization to ConsumerDirect/SmartCredit.
-  // This is NOT used as the proxy key.
-  const b =
-    req.header("x-cd-authorization") ||
-    req.header("authorization") ||
-    "";
-  return b;
+  return req.header("x-cd-authorization") || req.header("authorization") || "";
 }
 
 function buildForwardHeaders(req, extra = {}) {
@@ -102,38 +74,26 @@ function buildForwardHeaders(req, extra = {}) {
 }
 
 async function axiosRequest(url, method, headers, data) {
-  // responseType arraybuffer preserves JSON/text/binary safely
   return axios.request({
     url,
     method,
     headers,
     data,
     responseType: "arraybuffer",
-    // IMPORTANT: force Fixie usage via agents
     httpAgent,
     httpsAgent,
-    // don’t throw on non-2xx; we pass through status codes
     validateStatus: () => true,
   });
 }
 
 function sendUpstream(res, upstream) {
-  // Copy content-type if present
   const ct = upstream.headers?.["content-type"];
   if (ct) res.setHeader("content-type", ct);
-
-  // Pass through status + body
   res.status(upstream.status);
-
-  // upstream.data is a Buffer (arraybuffer)
   return res.send(Buffer.from(upstream.data));
 }
 
-// =======================
-// Public routes (NO key)
-// =======================
-
-// Root (so you never see "Cannot GET /" again)
+// Root (so you never see "Cannot GET /")
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -145,7 +105,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// PUBLIC: prove egress IP via Fixie (hit this 5 times with hard refresh)
+// PUBLIC: prove egress IP via Fixie (hard refresh 5x)
 app.get("/cd/ip", async (req, res) => {
   try {
     const upstream = await axiosRequest(
@@ -158,7 +118,7 @@ app.get("/cd/ip", async (req, res) => {
       undefined
     );
 
-    let parsed = null;
+    let parsed;
     try {
       parsed = JSON.parse(Buffer.from(upstream.data).toString("utf8"));
     } catch {
@@ -168,7 +128,9 @@ app.get("/cd/ip", async (req, res) => {
     return res.json({
       ok: true,
       proxyEnabled: !!FIXIE_URL,
-      fixieEnvPreview: FIXIE_URL ? FIXIE_URL.replace(/\/\/.*?:.*?@/, "//***:***@") : null,
+      fixieEnvPreview: FIXIE_URL
+        ? FIXIE_URL.replace(/\/\/.*?:.*?@/, "//***:***@")
+        : null,
       ipify: parsed,
     });
   } catch (e) {
@@ -176,25 +138,24 @@ app.get("/cd/ip", async (req, res) => {
   }
 });
 
-// Simple health
+// Health
 app.get("/health", (req, res) => res.json({ ok: true }));
-
-// =======================
-// Protected passthroughs
-// =======================
 
 // ConsumerDirect passthrough: /cd/* -> https://papi.consumerdirect.io/*
 app.all("/cd/*", async (req, res) => {
-  const authErr = requireProxyKey(req);
-  if (authErr) return res.status(401).json(authErr);
+  // NOTE: /cd/ip is public, but everything else under /cd/* is protected
+  if (req.path !== "/ip") {
+    const authErr = requireProxyKey(req);
+    if (authErr) return res.status(401).json(authErr);
+  }
 
   try {
-    const pathAndQuery = req.originalUrl.replace(/^\/cd/, ""); // keeps query string
+    // Keep query string
+    const pathAndQuery = req.originalUrl.replace(/^\/cd/, "");
     const url = `${CONSUMERDIRECT_BASE_URL}${pathAndQuery}`;
 
     const headers = buildForwardHeaders(req);
 
-    // Only attach body for non-GET/HEAD
     let data = undefined;
     if (!["GET", "HEAD"].includes(req.method)) {
       data = req.body ?? {};
