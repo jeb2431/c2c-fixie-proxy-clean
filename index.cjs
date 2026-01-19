@@ -1,230 +1,184 @@
-// index.cjs (FULL COPY/REPLACE)
+// index.cjs  (FULL REPLACEMENT)
+// Render proxy for ConsumerDirect/SmartCredit calls via Fixie static IP
+// Routes:
+//   GET  /            -> basic alive
+//   GET  /cd/health   -> health + env check
+//   GET  /cd/ip       -> confirms outbound fetch (and proxy) works
+//   ALL  /cd/*        -> forwards to ConsumerDirect base URL, using Fixie proxy agents
+//
+// Security:
+//   If CD_PROXY_INTERNAL_SHARED_SECRET is set, all /cd/* routes require header:
+//     X-Shared-Secret: <CD_PROXY_INTERNAL_SHARED_SECRET>
 
 const express = require("express");
 const cors = require("cors");
-
-const { HttpsProxyAgent } = require("https-proxy-agent");
+const axios = require("axios");
 const { HttpProxyAgent } = require("http-proxy-agent");
+const { HttpsProxyAgent } = require("https-proxy-agent");
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
 
-// --------------------
-// ENV
-// --------------------
+// ---------- Config ----------
 const PORT = process.env.PORT || 10000;
 
-// Where to forward Partner API calls
-const CD_PAPI_BASE_URL = (process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io").trim();
+// ConsumerDirect base (PAPI) - default to papi.consumerdirect.io
+// Step C is calling /cd/v1/... so that will map to https://papi.consumerdirect.io/v1/...
+const CD_BASE_URL = (process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io").replace(/\/+$/, "");
 
-// Outbound proxy (Fixie)
-const FIXIE_URL = (process.env.FIXIE_URL || "").trim();
-const HTTP_PROXY = (process.env.HTTP_PROXY || "").trim();
-const HTTPS_PROXY = (process.env.HTTPS_PROXY || "").trim();
+// Secret between Base44 and Render proxy
+const SHARED_SECRET = (process.env.CD_PROXY_INTERNAL_SHARED_SECRET || "").trim();
 
-// Security keys for calling THIS proxy
-const PROXY_API_KEY = (process.env.PROXY_API_KEY || "").trim(); // client sends: x-proxy-api-key
-const CD_PROXY_INTERNAL_SHARED_SECRET = (process.env.CD_PROXY_INTERNAL_SHARED_SECRET || "").trim(); // client sends: X-Shared-Secret
+// Fixie proxy URL (Render env usually provides FIXIE_URL; sometimes HTTPS_PROXY/HTTP_PROXY)
+const FIXIE_URL =
+  (process.env.FIXIE_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
 
-// PAPI creds (proxy can mint token if you want)
-const CD_PAPI_PROD_CLIENT_ID = (process.env.CD_PAPI_PROD_CLIENT_ID || "").trim();
-const CD_PAPI_PROD_CLIENT_SECRET = (process.env.CD_PAPI_PROD_CLIENT_SECRET || "").trim();
-const CD_PAPI_SCOPE = (process.env.CD_PAPI_SCOPE || "").trim();
-const CD_PAPI_OAUTH_URL = (process.env.CD_PAPI_OAUTH_URL || "https://auth.consumerdirect.io/oauth2/token").trim();
+// ---------- Middleware ----------
+app.use(cors());
+app.use(express.json({ limit: "2mb" })); // adjust if needed
+app.use(express.text({ type: ["text/*", "application/x-www-form-urlencoded"], limit: "2mb" }));
 
-// --------------------
-// CORS
-// --------------------
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
-
-app.use(
-  cors({
-    origin: function (origin, cb) {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.length === 0) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS not allowed"), false);
-    },
-    credentials: true,
-  })
-);
-
-// --------------------
-// Proxy agents (Fixie)
-// --------------------
-function getUpstreamProxyUrl() {
-  return FIXIE_URL || HTTPS_PROXY || HTTP_PROXY || "";
+function requireSharedSecret(req, res) {
+  if (!SHARED_SECRET) return true; // if not set, we won't block (but you SHOULD set it)
+  const got = (req.headers["x-shared-secret"] || "").trim();
+  if (!got || got !== SHARED_SECRET) {
+    res.status(401).json({ ok: false, error: "UNAUTHORIZED", message: "Missing/invalid X-Shared-Secret" });
+    return false;
+  }
+  return true;
 }
 
-function getAgentForUrl(targetUrl) {
-  const proxyUrl = getUpstreamProxyUrl();
-  if (!proxyUrl) return null;
-  if (targetUrl.startsWith("https://")) return new HttpsProxyAgent(proxyUrl);
-  return new HttpProxyAgent(proxyUrl);
+function buildAgents() {
+  // If FIXIE_URL isn't set, axios will do direct outbound (not what you want for whitelisting)
+  if (!FIXIE_URL) return { httpAgent: undefined, httpsAgent: undefined, proxyEnabled: false };
+
+  return {
+    httpAgent: new HttpProxyAgent(FIXIE_URL),
+    httpsAgent: new HttpsProxyAgent(FIXIE_URL),
+    proxyEnabled: true
+  };
 }
 
-const upstreamProxyUrl = getUpstreamProxyUrl();
-if (upstreamProxyUrl) {
-  console.log("[proxy] Using upstream proxy:", upstreamProxyUrl.replace(/\/\/.*@/, "//***:***@"));
-} else {
-  console.log("[proxy] No upstream proxy configured (FIXIE_URL/HTTP_PROXY/HTTPS_PROXY empty)");
+function safeHeaderNames(headers) {
+  return Object.keys(headers || {}).map((h) => h.toLowerCase());
 }
 
-// --------------------
-// Auth helpers
-// --------------------
-function requireProxyApiKey(req, res, next) {
-  if (!PROXY_API_KEY) return res.status(500).json({ ok: false, error: "PROXY_MISSING_PROXY_API_KEY" });
-  const got = (req.headers["x-proxy-api-key"] || "").toString().trim();
-  if (!got || got !== PROXY_API_KEY) return res.status(401).json({ ok: false, error: "INVALID_PROXY_API_KEY" });
-  next();
-}
+// ---------- Routes ----------
+app.get("/", (req, res) => {
+  res.status(200).send("ok");
+});
 
-function requireSharedSecret(req, res, next) {
-  if (!CD_PROXY_INTERNAL_SHARED_SECRET) return res.status(500).json({ ok: false, error: "PROXY_MISSING_INTERNAL_SHARED_SECRET" });
-  const got = (req.headers["x-shared-secret"] || "").toString().trim();
-  if (!got || got !== CD_PROXY_INTERNAL_SHARED_SECRET) return res.status(401).json({ ok: false, error: "INVALID_SHARED_SECRET" });
-  next();
-}
-
-// --------------------
-// Health / Debug
-// --------------------
-app.get("/health", (req, res) => {
-  res.json({
+app.get("/cd/health", (req, res) => {
+  res.status(200).json({
     ok: true,
     service: "c2c-fixie-proxy-clean",
-    proxyConfigured: !!getUpstreamProxyUrl(),
-    baseUrl: CD_PAPI_BASE_URL,
+    cdBaseUrl: CD_BASE_URL,
+    hasSharedSecret: !!SHARED_SECRET,
+    hasFixieUrl: !!FIXIE_URL,
+    hasHttpsProxyEnv: !!process.env.HTTPS_PROXY,
+    hasHttpProxyEnv: !!process.env.HTTP_PROXY
   });
 });
 
-// IMPORTANT: this returns the *true* egress IP by calling ipify THROUGH the upstream proxy agent
-app.get("/egress-ip", async (req, res) => {
+// Confirms outbound fetch works from inside Render, and (if FIXIE_URL is set) uses Fixie
+app.get("/cd/ip", async (req, res) => {
   try {
-    const url = "https://api.ipify.org?format=json";
-    const agent = getAgentForUrl(url);
-    const r = await fetch(url, { agent });
-    const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
-    res.status(r.status).json(json || { raw: text });
+    const agents = buildAgents();
+
+    const r = await axios.get("https://api.ipify.org?format=json", {
+      timeout: 15000,
+      httpAgent: agents.httpAgent,
+      httpsAgent: agents.httpsAgent,
+      // IMPORTANT: axios "proxy" option must be false when using custom agents
+      proxy: false
+    });
+
+    res.status(200).json({
+      ok: true,
+      proxyEnabled: agents.proxyEnabled,
+      ipify: r.data
+    });
   } catch (e) {
-    res.status(500).json({ ok: false, error: "EGRESS_IP_FAILED", message: e?.message || String(e) });
+    res.status(500).json({
+      ok: false,
+      error: "OUTBOUND_FETCH_FAILED",
+      message: String(e?.message || e)
+    });
   }
 });
 
-// --------------------
-// PAPI token mint (optional helper)
-// --------------------
-app.post("/papi/oauth/token", requireProxyApiKey, async (req, res) => {
+// Main proxy: forward anything under /cd/* to ConsumerDirect PAPI
+app.all("/cd/*", async (req, res) => {
   try {
-    if (!CD_PAPI_PROD_CLIENT_ID || !CD_PAPI_PROD_CLIENT_SECRET) {
-      return res.status(500).json({ ok: false, error: "MISSING_PAPI_CREDS_IN_RENDER" });
+    if (!requireSharedSecret(req, res)) return;
+
+    // The path after /cd
+    const forwardPath = req.originalUrl.replace(/^\/cd/, "");
+    const targetUrl = `${CD_BASE_URL}${forwardPath}`;
+
+    // You MUST send Authorization from Base44 to this proxy for ConsumerDirect calls
+    // Otherwise ConsumerDirect will reject.
+    const auth = req.headers["authorization"];
+    if (!auth) {
+      return res.status(400).json({
+        ok: false,
+        error: "MISSING_AUTHORIZATION",
+        message: "Base44 must send Authorization: Bearer <papiAccessToken> to the proxy so we can forward it to ConsumerDirect."
+      });
     }
 
-    const basic = Buffer.from(`${CD_PAPI_PROD_CLIENT_ID}:${CD_PAPI_PROD_CLIENT_SECRET}`).toString("base64");
+    const agents = buildAgents();
 
-    const params = new URLSearchParams();
-    params.set("grant_type", "client_credentials");
-    if (CD_PAPI_SCOPE) params.set("scope", CD_PAPI_SCOPE);
-
-    const agent = getAgentForUrl(CD_PAPI_OAUTH_URL);
-
-    const r = await fetch(CD_PAPI_OAUTH_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${basic}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: params.toString(),
-      agent,
-    });
-
-    const text = await r.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
-
-    if (!r.ok) return res.status(r.status).json({ ok: false, error: "PAPI_OAUTH_FAILED", raw: text, parsed: json });
-
-    return res.json({ ok: true, ...json });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "PAPI_OAUTH_EXCEPTION", message: e?.message || String(e) });
-  }
-});
-
-// --------------------
-// CORE: Forward /papi/* -> https://papi.consumerdirect.io/*
-// (strip the leading "/papi")
-// --------------------
-app.use("/papi", requireProxyApiKey, async (req, res) => {
-  try {
-    const upstreamPath = req.originalUrl.replace(/^\/papi/, ""); // <-- THIS is the critical fix
-    const targetUrl = CD_PAPI_BASE_URL.replace(/\/$/, "") + upstreamPath;
-
-    const agent = getAgentForUrl(targetUrl);
-
-    // copy headers but remove host and our auth header
+    // Forward headers (strip hop-by-hop)
     const headers = { ...req.headers };
     delete headers.host;
-    delete headers["x-proxy-api-key"];
+    delete headers.connection;
+    delete headers["content-length"];
 
-    const r = await fetch(targetUrl, {
+    // Axios expects data in req.body (json middleware) OR raw text
+    let data = undefined;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      data = req.body;
+      // If body is an object, axios will JSON stringify; if it's a string, it will send as-is.
+    }
+
+    const axRes = await axios.request({
       method: req.method,
+      url: targetUrl,
       headers,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body || {}),
-      agent,
+      data,
+      timeout: 30000,
+      httpAgent: agents.httpAgent,
+      httpsAgent: agents.httpsAgent,
+      proxy: false,
+      validateStatus: () => true // we forward non-2xx back to caller
     });
 
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.status(r.status);
+    // Forward status + body (and select headers)
+    // Do NOT blindly forward all headers (CORS / transfer-encoding / etc).
+    const passthroughHeaders = {};
+    const allowList = ["content-type", "cache-control", "pragma", "expires"];
+    for (const [k, v] of Object.entries(axRes.headers || {})) {
+      if (allowList.includes(k.toLowerCase())) passthroughHeaders[k] = v;
+    }
 
-    // pass content-type through
-    const ct = r.headers.get("content-type");
-    if (ct) res.setHeader("content-type", ct);
-
-    return res.send(buf);
+    res.status(axRes.status).set(passthroughHeaders).send(axRes.data);
   } catch (e) {
-    return res.status(500).json({ ok: false, error: "PAPI_PROXY_FAILED", message: e?.message || String(e) });
+    // This is the "fetch failed" / network-level error bucket
+    res.status(500).json({
+      ok: false,
+      error: "CD_PROXY_FAILED",
+      message: String(e?.message || e)
+    });
   }
 });
 
-// --------------------
-// LEGACY: Forward /cd/* -> https://papi.consumerdirect.io/*
-// (strip "/cd") + require X-Shared-Secret
-// --------------------
-app.use("/cd", requireSharedSecret, async (req, res) => {
-  try {
-    const upstreamPath = req.originalUrl.replace(/^\/cd/, "");
-    const targetUrl = CD_PAPI_BASE_URL.replace(/\/$/, "") + upstreamPath;
-
-    const agent = getAgentForUrl(targetUrl);
-
-    const headers = { ...req.headers };
-    delete headers.host;
-    delete headers["x-shared-secret"];
-
-    const r = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body || {}),
-      agent,
-    });
-
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.status(r.status);
-
-    const ct = r.headers.get("content-type");
-    if (ct) res.setHeader("content-type", ct);
-
-    return res.send(buf);
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "CD_PROXY_FAILED", message: e?.message || String(e) });
-  }
+// ---------- Start ----------
+app.listen(PORT, () => {
+  console.log("[proxy] listening", {
+    port: PORT,
+    cdBaseUrl: CD_BASE_URL,
+    hasSharedSecret: !!SHARED_SECRET,
+    hasFixieUrl: !!FIXIE_URL,
+    fixiePreview: FIXIE_URL ? FIXIE_URL.slice(0, 18) + "…" : null
+  });
 });
-
-app.listen(PORT, () => console.log("proxy listening on", PORT));
