@@ -1,13 +1,18 @@
 // index.cjs  (FULL REPLACEMENT)
-// Render proxy for ConsumerDirect/SmartCredit calls via Fixie static IP
+// Render proxy for ConsumerDirect/SmartCredit + Dispute Desk calls via Fixie static IP
+//
 // Routes:
-//   GET  /            -> basic alive
-//   GET  /cd/health   -> health + env check
-//   GET  /cd/ip       -> confirms outbound fetch (and proxy) works
-//   ALL  /cd/*        -> forwards to ConsumerDirect base URL, using Fixie proxy agents
+//   GET  /                      -> basic alive
+//   GET  /cd/health             -> ConsumerDirect health + env check
+//   GET  /cd/ip                 -> confirms outbound fetch (and proxy) works
+//   ALL  /cd/*                  -> forwards to ConsumerDirect base URL via Fixie
+//
+//   GET  /disputedesk/health    -> Dispute Desk health + env check
+//   GET  /disputedesk/ip        -> confirms outbound fetch (and proxy) works
+//   ALL  /disputedesk/*         -> forwards to Dispute Desk base URL via Fixie
 //
 // Security:
-//   If CD_PROXY_INTERNAL_SHARED_SECRET is set, all /cd/* routes require header:
+//   If CD_PROXY_INTERNAL_SHARED_SECRET is set, all /cd/* and /disputedesk/* routes require header:
 //     X-Shared-Secret: <CD_PROXY_INTERNAL_SHARED_SECRET>
 
 const express = require("express");
@@ -21,35 +26,42 @@ const app = express();
 // ---------- Config ----------
 const PORT = process.env.PORT || 10000;
 
-// ConsumerDirect base (PAPI) - default to papi.consumerdirect.io
-// Step C is calling /cd/v1/... so that will map to https://papi.consumerdirect.io/v1/...
+// ConsumerDirect base (PAPI)
 const CD_BASE_URL = (process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io").replace(/\/+$/, "");
+
+// Dispute Desk base
+const DISPUTE_DESK_BASE_URL = (process.env.DISPUTE_DESK_BASE_URL || "https://api.disputedesk.com").replace(/\/+$/, "");
 
 // Secret between Base44 and Render proxy
 const SHARED_SECRET = (process.env.CD_PROXY_INTERNAL_SHARED_SECRET || "").trim();
 
-// Fixie proxy URL (Render env usually provides FIXIE_URL; sometimes HTTPS_PROXY/HTTP_PROXY)
+// Fixie proxy URL
 const FIXIE_URL =
   (process.env.FIXIE_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
 
 // ---------- Middleware ----------
 app.use(cors());
-app.use(express.json({ limit: "2mb" })); // adjust if needed
-app.use(express.text({ type: ["text/*", "application/x-www-form-urlencoded"], limit: "2mb" }));
+app.use(express.json({ limit: "5mb" }));
+app.use(express.text({ type: ["text/*", "application/x-www-form-urlencoded"], limit: "5mb" }));
 
 function requireSharedSecret(req, res) {
-  if (!SHARED_SECRET) return true; // if not set, we won't block (but you SHOULD set it)
+  if (!SHARED_SECRET) return true;
   const got = (req.headers["x-shared-secret"] || "").trim();
   if (!got || got !== SHARED_SECRET) {
-    res.status(401).json({ ok: false, error: "UNAUTHORIZED", message: "Missing/invalid X-Shared-Secret" });
+    res.status(401).json({
+      ok: false,
+      error: "UNAUTHORIZED",
+      message: "Missing/invalid X-Shared-Secret"
+    });
     return false;
   }
   return true;
 }
 
 function buildAgents() {
-  // If FIXIE_URL isn't set, axios will do direct outbound (not what you want for whitelisting)
-  if (!FIXIE_URL) return { httpAgent: undefined, httpsAgent: undefined, proxyEnabled: false };
+  if (!FIXIE_URL) {
+    return { httpAgent: undefined, httpsAgent: undefined, proxyEnabled: false };
+  }
 
   return {
     httpAgent: new HttpProxyAgent(FIXIE_URL),
@@ -58,87 +70,52 @@ function buildAgents() {
   };
 }
 
-function safeHeaderNames(headers) {
-  return Object.keys(headers || {}).map((h) => h.toLowerCase());
+async function testOutbound(url) {
+  const agents = buildAgents();
+
+  const r = await axios.get(url, {
+    timeout: 15000,
+    httpAgent: agents.httpAgent,
+    httpsAgent: agents.httpsAgent,
+    proxy: false,
+    validateStatus: () => true
+  });
+
+  return {
+    proxyEnabled: agents.proxyEnabled,
+    status: r.status,
+    data: r.data
+  };
 }
 
-// ---------- Routes ----------
-app.get("/", (req, res) => {
-  res.status(200).send("ok");
-});
-
-app.get("/cd/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "c2c-fixie-proxy-clean",
-    cdBaseUrl: CD_BASE_URL,
-    hasSharedSecret: !!SHARED_SECRET,
-    hasFixieUrl: !!FIXIE_URL,
-    hasHttpsProxyEnv: !!process.env.HTTPS_PROXY,
-    hasHttpProxyEnv: !!process.env.HTTP_PROXY
-  });
-});
-
-// Confirms outbound fetch works from inside Render, and (if FIXIE_URL is set) uses Fixie
-app.get("/cd/ip", async (req, res) => {
-  try {
-    const agents = buildAgents();
-
-    const r = await axios.get("https://api.ipify.org?format=json", {
-      timeout: 15000,
-      httpAgent: agents.httpAgent,
-      httpsAgent: agents.httpsAgent,
-      // IMPORTANT: axios "proxy" option must be false when using custom agents
-      proxy: false
-    });
-
-    res.status(200).json({
-      ok: true,
-      proxyEnabled: agents.proxyEnabled,
-      ipify: r.data
-    });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: "OUTBOUND_FETCH_FAILED",
-      message: String(e?.message || e)
-    });
-  }
-});
-
-// Main proxy: forward anything under /cd/* to ConsumerDirect PAPI
-app.all("/cd/*", async (req, res) => {
+async function forwardRequest(req, res, { baseUrl, prefix, requireAuthorization }) {
   try {
     if (!requireSharedSecret(req, res)) return;
 
-    // The path after /cd
-    const forwardPath = req.originalUrl.replace(/^\/cd/, "");
-    const targetUrl = `${CD_BASE_URL}${forwardPath}`;
+    const forwardPath = req.originalUrl.replace(new RegExp(`^\\/${prefix}`), "");
+    const targetUrl = `${baseUrl}${forwardPath}`;
 
-    // You MUST send Authorization from Base44 to this proxy for ConsumerDirect calls
-    // Otherwise ConsumerDirect will reject.
-    const auth = req.headers["authorization"];
-    if (!auth) {
-      return res.status(400).json({
-        ok: false,
-        error: "MISSING_AUTHORIZATION",
-        message: "Base44 must send Authorization: Bearer <papiAccessToken> to the proxy so we can forward it to ConsumerDirect."
-      });
+    if (requireAuthorization) {
+      const auth = req.headers["authorization"];
+      if (!auth) {
+        return res.status(400).json({
+          ok: false,
+          error: "MISSING_AUTHORIZATION",
+          message: "Base44 must send Authorization: Bearer <token> to the proxy so we can forward it."
+        });
+      }
     }
 
     const agents = buildAgents();
 
-    // Forward headers (strip hop-by-hop)
     const headers = { ...req.headers };
     delete headers.host;
     delete headers.connection;
     delete headers["content-length"];
 
-    // Axios expects data in req.body (json middleware) OR raw text
     let data = undefined;
     if (req.method !== "GET" && req.method !== "HEAD") {
       data = req.body;
-      // If body is an object, axios will JSON stringify; if it's a string, it will send as-is.
     }
 
     const axRes = await axios.request({
@@ -150,11 +127,9 @@ app.all("/cd/*", async (req, res) => {
       httpAgent: agents.httpAgent,
       httpsAgent: agents.httpsAgent,
       proxy: false,
-      validateStatus: () => true // we forward non-2xx back to caller
+      validateStatus: () => true
     });
 
-    // Forward status + body (and select headers)
-    // Do NOT blindly forward all headers (CORS / transfer-encoding / etc).
     const passthroughHeaders = {};
     const allowList = ["content-type", "cache-control", "pragma", "expires"];
     for (const [k, v] of Object.entries(axRes.headers || {})) {
@@ -163,13 +138,87 @@ app.all("/cd/*", async (req, res) => {
 
     res.status(axRes.status).set(passthroughHeaders).send(axRes.data);
   } catch (e) {
-    // This is the "fetch failed" / network-level error bucket
     res.status(500).json({
       ok: false,
-      error: "CD_PROXY_FAILED",
+      error: `${prefix.toUpperCase()}_PROXY_FAILED`,
       message: String(e?.message || e)
     });
   }
+}
+
+// ---------- Base Routes ----------
+app.get("/", (_req, res) => {
+  res.status(200).send("ok");
+});
+
+// ---------- ConsumerDirect Routes ----------
+app.get("/cd/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "c2c-fixie-proxy-clean",
+    route: "cd",
+    cdBaseUrl: CD_BASE_URL,
+    hasSharedSecret: !!SHARED_SECRET,
+    hasFixieUrl: !!FIXIE_URL,
+    hasHttpsProxyEnv: !!process.env.HTTPS_PROXY,
+    hasHttpProxyEnv: !!process.env.HTTP_PROXY
+  });
+});
+
+app.get("/cd/ip", async (_req, res) => {
+  try {
+    const result = await testOutbound("https://api.ipify.org?format=json");
+    res.status(200).json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: "OUTBOUND_FETCH_FAILED",
+      message: String(e?.message || e)
+    });
+  }
+});
+
+app.all("/cd/*", async (req, res) => {
+  return forwardRequest(req, res, {
+    baseUrl: CD_BASE_URL,
+    prefix: "cd",
+    requireAuthorization: true
+  });
+});
+
+// ---------- Dispute Desk Routes ----------
+app.get("/disputedesk/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "c2c-fixie-proxy-clean",
+    route: "disputedesk",
+    disputeDeskBaseUrl: DISPUTE_DESK_BASE_URL,
+    hasSharedSecret: !!SHARED_SECRET,
+    hasFixieUrl: !!FIXIE_URL,
+    hasHttpsProxyEnv: !!process.env.HTTPS_PROXY,
+    hasHttpProxyEnv: !!process.env.HTTP_PROXY
+  });
+});
+
+app.get("/disputedesk/ip", async (_req, res) => {
+  try {
+    const result = await testOutbound("https://api.ipify.org?format=json");
+    res.status(200).json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: "OUTBOUND_FETCH_FAILED",
+      message: String(e?.message || e)
+    });
+  }
+});
+
+app.all("/disputedesk/*", async (req, res) => {
+  return forwardRequest(req, res, {
+    baseUrl: DISPUTE_DESK_BASE_URL,
+    prefix: "disputedesk",
+    requireAuthorization: false
+  });
 });
 
 // ---------- Start ----------
@@ -177,6 +226,7 @@ app.listen(PORT, () => {
   console.log("[proxy] listening", {
     port: PORT,
     cdBaseUrl: CD_BASE_URL,
+    disputeDeskBaseUrl: DISPUTE_DESK_BASE_URL,
     hasSharedSecret: !!SHARED_SECRET,
     hasFixieUrl: !!FIXIE_URL,
     fixiePreview: FIXIE_URL ? FIXIE_URL.slice(0, 18) + "…" : null
