@@ -239,12 +239,6 @@ function withClientKeyInQuery(url, clientKey) {
   return u.toString();
 }
 
-function maybeAddClientKeyToBody(data, clientKey) {
-  if (!clientKey || !data || typeof data !== "object" || Array.isArray(data)) return data;
-  if (Object.prototype.hasOwnProperty.call(data, "clientKey")) return data;
-  return { ...data, clientKey };
-}
-
 async function forwardSapi(req, res, { env }) {
   try {
     if (!requireSharedSecret(req, res)) return;
@@ -295,6 +289,7 @@ async function forwardSapi(req, res, { env }) {
 
     const headers = cleanForwardHeaders(req);
     headers["accept"] = "application/json";
+    headers["clientkey"] = clientKey;
 
     if (apiKey) headers["apikey"] = apiKey;
     if (apiSecret) headers["apisecret"] = apiSecret;
@@ -302,7 +297,9 @@ async function forwardSapi(req, res, { env }) {
     let data = undefined;
     if (req.method !== "GET" && req.method !== "HEAD") {
       headers["content-type"] = "application/json";
-      data = maybeAddClientKeyToBody(req.body, clientKey);
+      // Critical: do NOT inject clientKey into the POST body.
+      // ConsumerDirect SAPI validates request bodies strictly. Forward the body exactly as Base44 sends it.
+      data = req.body;
     }
 
     const axRes = await axiosForward({
