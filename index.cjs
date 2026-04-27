@@ -1,29 +1,26 @@
 // index.cjs  (FULL REPLACEMENT)
 // Render proxy for ConsumerDirect/SmartCredit + Dispute Desk calls via Fixie static IP
 //
-// Important DD1 fix:
-// Adds explicit Dispute Desk routes for LoginToken, GrantPortalAccess, Provider Status,
-// AccountOverview, RetrieveReport, create client, and link provider.
+// Purpose:
+// - Keep Base44 outbound calls going through Render
+// - Render sends outbound through Fixie static IP
+// - ConsumerDirect / SmartCredit sees the whitelisted Fixie IP
 //
-// SAPI fix:
-// Adds ConsumerDirect Signup API proxy routes for /sapi-production/* and /sapi-stage/*.
-// These routes keep SAPI credentials server-side on Render and send outbound traffic through Fixie.
+// Main routes:
+// - /cd/*            -> ConsumerDirect PAPI
+// - /smartcredit/*   -> SmartCredit session/API route used by old working debugger Step 5
+// - /disputedesk/*   -> Dispute Desk
 //
-// Required env vars on Render:
+// Required Render env vars:
 // - CD_PROXY_INTERNAL_SHARED_SECRET
 // - FIXIE_URL
 // - CD_PAPI_BASE_URL
 // - DISPUTE_DESK_BASE_URL
 // - DISPUTE_DESK_API_KEY
-// - CD_SAPI_PRODUCTION_BASE_URL
-// - CD_SAPI_PRODUCTION_CLIENT_KEY
-// - CD_SAPI_STAGE_BASE_URL
-// - CD_SAPI_STAGE_CLIENT_KEY
-// Optional SAPI env vars on Render:
-// - CD_SAPI_PRODUCTION_API_KEY or fallback SC_API_KEY
-// - CD_SAPI_PRODUCTION_API_SECRET or fallback SC_API_SECRET
-// - CD_SAPI_STAGE_API_KEY or fallback SC_API_KEY
-// - CD_SAPI_STAGE_API_SECRET or fallback SC_API_SECRET
+//
+// Optional Render env vars:
+// - SMARTCREDIT_BASE_URL
+// - CD_SMARTCREDIT_BASE_URL
 
 const express = require("express");
 const cors = require("cors");
@@ -36,24 +33,22 @@ const app = express();
 // ---------- Config ----------
 const PORT = process.env.PORT || 10000;
 
-// ConsumerDirect base
-const CD_BASE_URL = (process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io").replace(/\/+$/, "");
+// ConsumerDirect PAPI base
+const CD_BASE_URL = (
+  process.env.CD_PAPI_BASE_URL || "https://papi.consumerdirect.io"
+).replace(/\/+$/, "");
 
-// ConsumerDirect SAPI bases
-const CD_SAPI_PRODUCTION_BASE_URL = (process.env.CD_SAPI_PRODUCTION_BASE_URL || "https://api.consumerdirect.io").replace(/\/+$/, "");
-const CD_SAPI_STAGE_BASE_URL = (process.env.CD_SAPI_STAGE_BASE_URL || "https://stage-api.consumerdirect.io").replace(/\/+$/, "");
-
-// ConsumerDirect SAPI keys
-const CD_SAPI_PRODUCTION_CLIENT_KEY = (process.env.CD_SAPI_PRODUCTION_CLIENT_KEY || process.env.SC_PROD_CLIENT_KEY || "").trim();
-const CD_SAPI_STAGE_CLIENT_KEY = (process.env.CD_SAPI_STAGE_CLIENT_KEY || process.env.CD_STAGE_CLIENT_KEY || "").trim();
-
-const CD_SAPI_PRODUCTION_API_KEY = (process.env.CD_SAPI_PRODUCTION_API_KEY || process.env.SC_API_KEY || "").trim();
-const CD_SAPI_PRODUCTION_API_SECRET = (process.env.CD_SAPI_PRODUCTION_API_SECRET || process.env.SC_API_SECRET || "").trim();
-const CD_SAPI_STAGE_API_KEY = (process.env.CD_SAPI_STAGE_API_KEY || process.env.SC_API_KEY || "").trim();
-const CD_SAPI_STAGE_API_SECRET = (process.env.CD_SAPI_STAGE_API_SECRET || process.env.SC_API_SECRET || "").trim();
+// SmartCredit base used by old working debugger Step 5
+const SMARTCREDIT_BASE_URL = (
+  process.env.SMARTCREDIT_BASE_URL ||
+  process.env.CD_SMARTCREDIT_BASE_URL ||
+  "https://api.smartcredit.com"
+).replace(/\/+$/, "");
 
 // Dispute Desk base
-const DISPUTE_DESK_BASE_URL = (process.env.DISPUTE_DESK_BASE_URL || "https://api.disputedesk.com").replace(/\/+$/, "");
+const DISPUTE_DESK_BASE_URL = (
+  process.env.DISPUTE_DESK_BASE_URL || "https://api.disputedesk.com"
+).replace(/\/+$/, "");
 
 // Dispute Desk API key
 const DISPUTE_DESK_API_KEY = (process.env.DISPUTE_DESK_API_KEY || "").trim();
@@ -62,8 +57,12 @@ const DISPUTE_DESK_API_KEY = (process.env.DISPUTE_DESK_API_KEY || "").trim();
 const SHARED_SECRET = (process.env.CD_PROXY_INTERNAL_SHARED_SECRET || "").trim();
 
 // Fixie proxy URL
-const FIXIE_URL =
-  (process.env.FIXIE_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "").trim();
+const FIXIE_URL = (
+  process.env.FIXIE_URL ||
+  process.env.HTTPS_PROXY ||
+  process.env.HTTP_PROXY ||
+  ""
+).trim();
 
 // ---------- Middleware ----------
 app.use(cors());
@@ -71,21 +70,23 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(express.text({ type: ["text/*"], limit: "10mb" }));
 
+// ---------- Helpers ----------
 function requireSharedSecret(req, res) {
   if (!SHARED_SECRET) return true;
 
   const got = String(
     req.headers["x-shared-secret"] ||
-    req.headers["x-c2c-proxy-secret"] ||
-    req.headers["x-proxy-api-key"] ||
-    ""
+      req.headers["x-cd-proxy-secret"] ||
+      req.headers["x-c2c-proxy-secret"] ||
+      req.headers["x-proxy-api-key"] ||
+      ""
   ).trim();
 
   if (!got || got !== SHARED_SECRET) {
     res.status(401).json({
       ok: false,
       error: "UNAUTHORIZED",
-      message: "Missing/invalid shared secret"
+      message: "Missing/invalid shared secret",
     });
     return false;
   }
@@ -98,14 +99,14 @@ function buildAgents() {
     return {
       httpAgent: undefined,
       httpsAgent: undefined,
-      proxyEnabled: false
+      proxyEnabled: false,
     };
   }
 
   return {
     httpAgent: new HttpProxyAgent(FIXIE_URL),
     httpsAgent: new HttpsProxyAgent(FIXIE_URL),
-    proxyEnabled: true
+    proxyEnabled: true,
   };
 }
 
@@ -115,7 +116,10 @@ function cleanForwardHeaders(req) {
   delete headers.host;
   delete headers.connection;
   delete headers["content-length"];
+
+  // Do not forward internal proxy auth headers upstream
   delete headers["x-shared-secret"];
+  delete headers["x-cd-proxy-secret"];
   delete headers["x-c2c-proxy-secret"];
   delete headers["x-proxy-api-key"];
 
@@ -126,7 +130,7 @@ function safeError(e) {
   return {
     message: String(e?.message || e),
     status: e?.response?.status || null,
-    data: e?.response?.data || null
+    data: e?.response?.data || null,
   };
 }
 
@@ -138,17 +142,17 @@ async function testOutbound(url) {
     httpAgent: agents.httpAgent,
     httpsAgent: agents.httpsAgent,
     proxy: false,
-    validateStatus: () => true
+    validateStatus: () => true,
   });
 
   return {
     proxyEnabled: agents.proxyEnabled,
     status: r.status,
-    data: r.data
+    data: r.data,
   };
 }
 
-async function axiosForward({ method, url, headers, data, timeout = 30000 }) {
+async function axiosForward({ method, url, headers, data, timeout = 45000 }) {
   const agents = buildAgents();
 
   return axios.request({
@@ -160,7 +164,7 @@ async function axiosForward({ method, url, headers, data, timeout = 30000 }) {
     httpAgent: agents.httpAgent,
     httpsAgent: agents.httpsAgent,
     proxy: false,
-    validateStatus: () => true
+    validateStatus: () => true,
   });
 }
 
@@ -190,7 +194,8 @@ async function forwardRequest(req, res, { baseUrl, prefix, requireAuthorization 
         return res.status(400).json({
           ok: false,
           error: "MISSING_AUTHORIZATION",
-          message: "Base44 must send Authorization: Bearer <token> to the proxy so we can forward it."
+          message:
+            "Base44 must send Authorization: Bearer <token> to the proxy so we can forward it.",
         });
       }
     }
@@ -206,117 +211,15 @@ async function forwardRequest(req, res, { baseUrl, prefix, requireAuthorization 
       method: req.method,
       url: targetUrl,
       headers,
-      data
-    });
-
-    return sendAxiosResponse(res, axRes);
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: `${prefix.toUpperCase()}_PROXY_FAILED`,
-      ...safeError(e)
-    });
-  }
-}
-
-function normalizeSapiForwardPath(originalUrl, prefix) {
-  const stripped = originalUrl.replace(new RegExp(`^\\/${prefix}`), "") || "/";
-  if (stripped === "/health") return null;
-
-  // Allow both /sapi-stage/start and /sapi-stage/v1/signup/start.
-  if (stripped.startsWith("/v1/signup/")) return stripped;
-  if (stripped === "/v1/signup") return stripped;
-
-  return `/v1/signup${stripped.startsWith("/") ? stripped : `/${stripped}`}`;
-}
-
-function withClientKeyInQuery(url, clientKey) {
-  if (!clientKey) return url;
-  const u = new URL(url);
-  if (!u.searchParams.get("clientKey")) {
-    u.searchParams.set("clientKey", clientKey);
-  }
-  return u.toString();
-}
-
-async function forwardSapi(req, res, { env }) {
-  try {
-    if (!requireSharedSecret(req, res)) return;
-
-    const isProduction = env === "production";
-    const prefix = isProduction ? "sapi-production" : "sapi-stage";
-    const baseUrl = isProduction ? CD_SAPI_PRODUCTION_BASE_URL : CD_SAPI_STAGE_BASE_URL;
-    const clientKey = isProduction ? CD_SAPI_PRODUCTION_CLIENT_KEY : CD_SAPI_STAGE_CLIENT_KEY;
-    const apiKey = isProduction ? CD_SAPI_PRODUCTION_API_KEY : CD_SAPI_STAGE_API_KEY;
-    const apiSecret = isProduction ? CD_SAPI_PRODUCTION_API_SECRET : CD_SAPI_STAGE_API_SECRET;
-
-    if (!baseUrl) {
-      return res.status(500).json({
-        ok: false,
-        error: "MISSING_SAPI_BASE_URL",
-        env
-      });
-    }
-
-    if (!clientKey) {
-      return res.status(500).json({
-        ok: false,
-        error: "MISSING_SAPI_CLIENT_KEY",
-        env
-      });
-    }
-
-    const forwardPath = normalizeSapiForwardPath(req.originalUrl, prefix);
-
-    if (!forwardPath) {
-      return res.status(200).json({
-        ok: true,
-        service: "c2c-fixie-proxy-clean",
-        route: prefix,
-        env,
-        targetBaseUrl: baseUrl,
-        targetPrefix: "/v1/signup",
-        hasSharedSecret: !!SHARED_SECRET,
-        hasFixieUrl: !!FIXIE_URL,
-        hasClientKey: !!clientKey,
-        hasApiKey: !!apiKey,
-        hasApiSecret: !!apiSecret
-      });
-    }
-
-    let targetUrl = `${baseUrl}${forwardPath}`;
-    targetUrl = withClientKeyInQuery(targetUrl, clientKey);
-
-    const headers = cleanForwardHeaders(req);
-    headers["accept"] = "application/json";
-    headers["clientkey"] = clientKey;
-
-    if (apiKey) headers["apikey"] = apiKey;
-    if (apiSecret) headers["apisecret"] = apiSecret;
-
-    let data = undefined;
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      headers["content-type"] = "application/json";
-      // Critical: do NOT inject clientKey into the POST body.
-      // ConsumerDirect SAPI validates request bodies strictly. Forward the body exactly as Base44 sends it.
-      data = req.body;
-    }
-
-    const axRes = await axiosForward({
-      method: req.method,
-      url: targetUrl,
-      headers,
       data,
-      timeout: 45000
     });
 
     return sendAxiosResponse(res, axRes);
   } catch (e) {
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
-      error: "SAPI_PROXY_FAILED",
-      env,
-      ...safeError(e)
+      error: `${String(prefix || "UNKNOWN").toUpperCase()}_PROXY_FAILED`,
+      ...safeError(e),
     });
   }
 }
@@ -329,14 +232,14 @@ async function forwardDisputeDesk(req, res, { method, path, body }) {
       return res.status(500).json({
         ok: false,
         error: "MISSING_DISPUTE_DESK_API_KEY",
-        message: "DISPUTE_DESK_API_KEY is not set on Render."
+        message: "DISPUTE_DESK_API_KEY is not set on Render.",
       });
     }
 
     const targetUrl = `${DISPUTE_DESK_BASE_URL}${path}`;
 
     const headers = cleanForwardHeaders(req);
-    headers["accept"] = "application/json";
+    headers.accept = "application/json";
     headers["x-api-key"] = DISPUTE_DESK_API_KEY;
 
     if (method !== "GET" && method !== "HEAD") {
@@ -347,15 +250,15 @@ async function forwardDisputeDesk(req, res, { method, path, body }) {
       method,
       url: targetUrl,
       headers,
-      data: body
+      data: body,
     });
 
     return sendAxiosResponse(res, axRes);
   } catch (e) {
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: "DISPUTE_DESK_PROXY_FAILED",
-      ...safeError(e)
+      ...safeError(e),
     });
   }
 }
@@ -365,7 +268,7 @@ app.get("/", (_req, res) => {
   res.status(200).json({
     ok: true,
     service: "c2c-fixie-proxy-clean",
-    message: "proxy alive"
+    message: "proxy alive",
   });
 });
 
@@ -379,7 +282,7 @@ app.get("/cd/health", (_req, res) => {
     hasSharedSecret: !!SHARED_SECRET,
     hasFixieUrl: !!FIXIE_URL,
     hasHttpsProxyEnv: !!process.env.HTTPS_PROXY,
-    hasHttpProxyEnv: !!process.env.HTTP_PROXY
+    hasHttpProxyEnv: !!process.env.HTTP_PROXY,
   });
 });
 
@@ -391,34 +294,62 @@ app.get("/cd/ip", async (_req, res) => {
     res.status(500).json({
       ok: false,
       error: "OUTBOUND_FETCH_FAILED",
-      ...safeError(e)
+      ...safeError(e),
     });
   }
 });
 
+// Generic ConsumerDirect PAPI route.
+// This keeps Step 3 / Step 4 behavior intact.
+// PAPI calls normally require Authorization: Bearer <PAPI token>.
 app.all("/cd/*", async (req, res) => {
   return forwardRequest(req, res, {
     baseUrl: CD_BASE_URL,
     prefix: "cd",
-    requireAuthorization: true
+    requireAuthorization: true,
   });
 });
 
-// ---------- ConsumerDirect SAPI Routes ----------
-app.get("/sapi-production/health", async (req, res) => {
-  return forwardSapi(req, res, { env: "production" });
+// ---------- SmartCredit Session/API Routes ----------
+// This restores the old working debugger Step 5 route:
+// GET /smartcredit/v1/login?code={otc}
+// Header from Base44:
+// x-cd-proxy-secret: CD_PROXY_INTERNAL_SHARED_SECRET
+app.get("/smartcredit/health", (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "c2c-fixie-proxy-clean",
+    route: "smartcredit",
+    smartCreditBaseUrl: SMARTCREDIT_BASE_URL,
+    hasSharedSecret: !!SHARED_SECRET,
+    hasFixieUrl: !!FIXIE_URL,
+    hasHttpsProxyEnv: !!process.env.HTTPS_PROXY,
+    hasHttpProxyEnv: !!process.env.HTTP_PROXY,
+  });
 });
 
-app.get("/sapi-stage/health", async (req, res) => {
-  return forwardSapi(req, res, { env: "stage" });
+app.get("/smartcredit/ip", async (_req, res) => {
+  try {
+    const result = await testOutbound("https://api.ipify.org?format=json");
+    res.status(200).json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: "OUTBOUND_FETCH_FAILED",
+      ...safeError(e),
+    });
+  }
 });
 
-app.all("/sapi-production/*", async (req, res) => {
-  return forwardSapi(req, res, { env: "production" });
-});
-
-app.all("/sapi-stage/*", async (req, res) => {
-  return forwardSapi(req, res, { env: "stage" });
+// Important:
+// Do NOT require Authorization here.
+// Old Step 5 only sent OTC code + internal proxy secret.
+app.all("/smartcredit/*", async (req, res) => {
+  return forwardRequest(req, res, {
+    baseUrl: SMARTCREDIT_BASE_URL,
+    prefix: "smartcredit",
+    requireAuthorization: false,
+  });
 });
 
 // ---------- Dispute Desk Health ----------
@@ -432,7 +363,7 @@ app.get("/disputedesk/health", (_req, res) => {
     hasSharedSecret: !!SHARED_SECRET,
     hasFixieUrl: !!FIXIE_URL,
     hasHttpsProxyEnv: !!process.env.HTTPS_PROXY,
-    hasHttpProxyEnv: !!process.env.HTTP_PROXY
+    hasHttpProxyEnv: !!process.env.HTTP_PROXY,
   });
 });
 
@@ -444,7 +375,7 @@ app.get("/disputedesk/ip", async (_req, res) => {
     res.status(500).json({
       ok: false,
       error: "OUTBOUND_FETCH_FAILED",
-      ...safeError(e)
+      ...safeError(e),
     });
   }
 });
@@ -456,7 +387,7 @@ app.post("/disputedesk/clients/create", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "POST",
     path: "/clients/create",
-    body: req.body
+    body: req.body,
   });
 });
 
@@ -465,7 +396,7 @@ app.post("/disputedesk/clients/link", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "POST",
     path: "/clients/link",
-    body: req.body
+    body: req.body,
   });
 });
 
@@ -474,16 +405,15 @@ app.put("/disputedesk/clients/link", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "PUT",
     path: "/clients/link",
-    body: req.body
+    body: req.body,
   });
 });
 
-// CRITICAL DD1 ROUTE:
 // Get short-lived CToken for DD portal login
 app.get("/disputedesk/clients/:token/LoginToken", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "GET",
-    path: `/clients/${encodeURIComponent(req.params.token)}/LoginToken`
+    path: `/clients/${encodeURIComponent(req.params.token)}/LoginToken`,
   });
 });
 
@@ -492,7 +422,7 @@ app.put("/disputedesk/clients/GrantPortalAccess/:token", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "PUT",
     path: `/clients/GrantPortalAccess/${encodeURIComponent(req.params.token)}`,
-    body: req.body || {}
+    body: req.body || {},
   });
 });
 
@@ -500,7 +430,7 @@ app.put("/disputedesk/clients/GrantPortalAccess/:token", async (req, res) => {
 app.delete("/disputedesk/clients/:token/PortalAccess", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "DELETE",
-    path: `/clients/${encodeURIComponent(req.params.token)}/PortalAccess`
+    path: `/clients/${encodeURIComponent(req.params.token)}/PortalAccess`,
   });
 });
 
@@ -508,7 +438,7 @@ app.delete("/disputedesk/clients/:token/PortalAccess", async (req, res) => {
 app.get("/disputedesk/clients/:token/Provider/Status", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "GET",
-    path: `/clients/${encodeURIComponent(req.params.token)}/Provider/Status`
+    path: `/clients/${encodeURIComponent(req.params.token)}/Provider/Status`,
   });
 });
 
@@ -517,7 +447,7 @@ app.put("/disputedesk/clients/:token/Provider/Status", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "PUT",
     path: `/clients/${encodeURIComponent(req.params.token)}/Provider/Status`,
-    body: req.body || {}
+    body: req.body || {},
   });
 });
 
@@ -525,7 +455,7 @@ app.put("/disputedesk/clients/:token/Provider/Status", async (req, res) => {
 app.get("/disputedesk/clients/AccountOverview/:token", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "GET",
-    path: `/clients/AccountOverview/${encodeURIComponent(req.params.token)}`
+    path: `/clients/AccountOverview/${encodeURIComponent(req.params.token)}`,
   });
 });
 
@@ -534,7 +464,7 @@ app.post("/disputedesk/clients/:token/CreditReports/retrievereport", async (req,
   return forwardDisputeDesk(req, res, {
     method: "POST",
     path: `/clients/${encodeURIComponent(req.params.token)}/CreditReports/retrievereport`,
-    body: req.body || {}
+    body: req.body || {},
   });
 });
 
@@ -543,7 +473,7 @@ app.post("/disputedesk/clients/:token/Dispute/Mode", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "POST",
     path: `/clients/${encodeURIComponent(req.params.token)}/Dispute/Mode`,
-    body: req.body || {}
+    body: req.body || {},
   });
 });
 
@@ -552,7 +482,7 @@ app.put("/disputedesk/clients/:token", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "PUT",
     path: `/clients/${encodeURIComponent(req.params.token)}`,
-    body: req.body || {}
+    body: req.body || {},
   });
 });
 
@@ -561,7 +491,7 @@ app.put("/disputedesk/clients/close/:token", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "PUT",
     path: `/clients/close/${encodeURIComponent(req.params.token)}`,
-    body: req.body || {}
+    body: req.body || {},
   });
 });
 
@@ -570,7 +500,7 @@ app.put("/disputedesk/clients/open/:token", async (req, res) => {
   return forwardDisputeDesk(req, res, {
     method: "PUT",
     path: `/clients/open/${encodeURIComponent(req.params.token)}`,
-    body: req.body || {}
+    body: req.body || {},
   });
 });
 
@@ -580,7 +510,7 @@ app.all("/disputedesk/*", async (req, res) => {
   return forwardRequest(req, res, {
     baseUrl: DISPUTE_DESK_BASE_URL,
     prefix: "disputedesk",
-    requireAuthorization: false
+    requireAuthorization: false,
   });
 });
 
@@ -590,7 +520,7 @@ app.use((req, res) => {
     ok: false,
     error: "NOT_FOUND",
     method: req.method,
-    path: req.originalUrl
+    path: req.originalUrl,
   });
 });
 
@@ -599,16 +529,11 @@ app.listen(PORT, () => {
   console.log("[proxy] listening", {
     port: PORT,
     cdBaseUrl: CD_BASE_URL,
+    smartCreditBaseUrl: SMARTCREDIT_BASE_URL,
     disputeDeskBaseUrl: DISPUTE_DESK_BASE_URL,
-    sapiProductionBaseUrl: CD_SAPI_PRODUCTION_BASE_URL,
-    sapiStageBaseUrl: CD_SAPI_STAGE_BASE_URL,
     hasDisputeDeskApiKey: !!DISPUTE_DESK_API_KEY,
-    hasSapiProductionClientKey: !!CD_SAPI_PRODUCTION_CLIENT_KEY,
-    hasSapiStageClientKey: !!CD_SAPI_STAGE_CLIENT_KEY,
-    hasSapiProductionApiKey: !!CD_SAPI_PRODUCTION_API_KEY,
-    hasSapiStageApiKey: !!CD_SAPI_STAGE_API_KEY,
     hasSharedSecret: !!SHARED_SECRET,
     hasFixieUrl: !!FIXIE_URL,
-    fixiePreview: FIXIE_URL ? FIXIE_URL.slice(0, 18) + "…" : null
+    fixiePreview: FIXIE_URL ? FIXIE_URL.slice(0, 18) + "…" : null,
   });
 });
